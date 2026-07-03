@@ -1,0 +1,955 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<!--
+============================================================================
+ DRAWING REVISION COMPARATOR — developer notes (read before modifying)
+============================================================================
+ Built by Claude (Anthropic) for comparing two PDF exports of the same
+ technical drawing (old revision vs. new revision) and producing a written
+ change summary + visual diff. Single static HTML file, no build step, no
+ backend — everything runs client-side in the browser for privacy (drawing
+ content never leaves the machine). The only external dependency is pdf.js,
+ loaded from a CDN <script> tag below purely to render/parse PDFs; that
+ network call fetches library code only, never the user's file contents.
+
+ ORIGINAL CONTEXT
+ -----------------
+ First requested for comparing PTC Creo 11 PDF exports. The approach below
+ is deliberately CAD-agnostic (nothing references Creo, or any specific
+ drawing template) so it can be pointed at exports from other tools/
+ companies. It was validated end-to-end against a synthetic hand-built test
+ drawing (sample_old_revB.pdf / sample_new_revC.pdf, also in this folder) —
+ that sample's content has zero influence on the algorithm, it only proved
+ the pipeline works. It had NOT been run against a real company's actual
+ template as of this writing — see "known failure modes" before trusting it
+ on an unfamiliar template.
+
+ APPROACH — three independent, purely client-side diff mechanisms
+ ------------------------------------------------------------------
+ 1. TEXT / DIMENSION DIFF  (see extractTextItems, diffTextItems)
+    Uses pdf.js `page.getTextContent()` to pull the PDF's embedded text
+    objects — real characters plus their (x,y) position — NOT pixels. The
+    diff logic is purely geometric/string-based and has no idea what the
+    drawing depicts; "REV: B" is just a string like any other. Two-pass
+    nearest-neighbor matching:
+      pass 1: identical string within a tiny position tolerance -> unchanged
+      pass 2: nearest leftover item within a looser tolerance   -> modified
+      anything never matched                                    -> added/removed
+    Because nothing here is hardcoded to specific drawing content, this
+    generalizes to any template — PROVIDED the PDF actually contains real
+    embedded text (see failure mode #1 below).
+
+ 2. TITLE BLOCK REGION  (see DEFAULT_REGION, getActiveRegion, openCalibration)
+    User drags a rectangle over the title block once; it's stored in
+    localStorage as a FRACTION of page width/height (not pixels), so it
+    survives different page sizes. DEFAULT_REGION (bottom-right corner) is
+    only a common-convention GUESS, not derived from any real template —
+    it is not safe to assume it's correct for a new company's drawings.
+    Calibrating against a real sheet is mandatory, not optional polish.
+
+ 3. VISUAL / PIXEL DIFF  (see computeVisualDiff)
+    Renders both pages to canvas at equal resolution, then does per-pixel
+    luminance thresholding (dark = "ink"), composited as gray (unchanged) /
+    red (old only) / blue (new only). Fully generic — works no matter what's
+    on the page. Assumes both revisions share the same page size/registration,
+    which holds by construction for revisions of the same drawing template.
+
+ KNOWN FAILURE MODES / LIMITATIONS
+ ------------------------------------
+ 1. Flattened/outlined text: some CAD PDF export settings convert text to
+    vector curves instead of embedded text (sometimes deliberate, so
+    dimensions can't be lifted/edited downstream). When that happens,
+    getTextContent() returns nothing, and the title-block + text diff will
+    silently report "no changes" even when things changed — while the
+    visual diff keeps working fine. This is the failure mode most likely to
+    bite on an unfamiliar template, and it is otherwise INVISIBLE. This is
+    exactly why updateTextDiagnostic() exists: right after a file loads, it
+    reports the extracted text-item count per file so this is never silent.
+    If you see its "no embedded text found" warning, trust the visual diff
+    only — the written text summary cannot be meaningful for that file.
+ 2. Threshold tuning: CONFIG.titleBlock / CONFIG.body distance thresholds
+    are fractions of page size (so they auto-scale to any page size), but a
+    drawing with very densely packed dimensions may need tighter values
+    than what's set here, to avoid matching the wrong neighboring text.
+ 3. Title block location/layout varies by drafting standard (bottom strip
+    vs. bottom-right block vs. right-side vertical block) — must be
+    recalibrated per template/company, every time the template changes.
+ 4. Page-size/aspect-ratio mismatch between old/new revisions makes the
+    visual overlay only approximate (flagged via sizeWarning in
+    runComparison, not corrected/re-registered).
+ 5. Position-based matching is inherently heuristic — it can occasionally
+    pair two unrelated nearby strings as "modified" rather than correctly
+    calling one "removed" and the other "added". Cross-check surprising
+    results against the visual diff / details table.
+============================================================================
+-->
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Drawing Revision Comparator</title>
+<script src="https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/legacy/build/pdf.min.js"></script>
+<style>
+  :root{
+    --bg:#f4f6f9; --panel:#ffffff; --ink:#1c2733; --ink-soft:#5b6774;
+    --accent:#1e5fa8; --accent-soft:#eaf1fb; --border:#d7dee6;
+    --red:#d62727; --blue:#206ede; --gray-mid:#5a5a5a; --green:#1f8a4c;
+  }
+  *{box-sizing:border-box;}
+  body{
+    margin:0; background:var(--bg); color:var(--ink);
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  }
+  header{ padding:24px 32px 8px; }
+  header h1{ margin:0 0 4px; font-size:22px; letter-spacing:.2px; }
+  header .subtitle{ margin:0; color:var(--ink-soft); font-size:14px; }
+  main{ max-width:1200px; margin:0 auto; padding:16px 32px 60px; }
+
+  section{ margin-bottom:20px; }
+
+  .upload-row{ display:flex; align-items:stretch; gap:14px; }
+  .swap-col{ display:flex; align-items:center; }
+  #swapBtn{
+    width:40px; height:40px; border-radius:50%; border:1px solid var(--border);
+    background:var(--panel); font-size:18px; cursor:pointer; color:var(--accent);
+  }
+  #swapBtn:hover{ background:var(--accent-soft); }
+
+  .file-card{
+    flex:1; background:var(--panel); border:1px solid var(--border); border-radius:10px;
+    padding:14px; display:flex; flex-direction:column; gap:8px;
+  }
+  .file-card h2{ margin:0; font-size:14px; text-transform:uppercase; letter-spacing:.6px; color:var(--ink-soft); }
+  .dropzone{
+    border:2px dashed var(--border); border-radius:8px; padding:22px 12px;
+    text-align:center; cursor:pointer; transition:.15s; min-height:70px;
+  }
+  .dropzone:hover, .dropzone.dragover{ border-color:var(--accent); background:var(--accent-soft); }
+  .drop-hint{ margin:0; color:var(--ink-soft); font-size:13px; }
+  .file-meta{ margin-top:6px; font-size:13px; font-weight:600; word-break:break-all; }
+  .page-picker{ font-size:13px; color:var(--ink-soft); }
+  .page-picker select{ margin-left:4px; }
+  .text-diag{ font-size:12px; margin-top:2px; }
+  .text-diag.ok{ color:var(--green); }
+  .text-diag.warn{ color:#a15c00; }
+
+  .controls-row{ display:flex; align-items:center; gap:14px; flex-wrap:wrap; }
+  button{
+    font:inherit; border:1px solid var(--border); background:var(--panel);
+    padding:9px 16px; border-radius:7px; cursor:pointer; color:var(--ink);
+  }
+  button:hover:not(:disabled){ border-color:var(--accent); color:var(--accent); }
+  button:disabled{ opacity:.45; cursor:not-allowed; }
+  #compareBtn{ background:var(--accent); color:#fff; border-color:var(--accent); font-weight:600; }
+  #compareBtn:hover:not(:disabled){ background:#174d8a; color:#fff; }
+  .hint{ font-size:13px; color:var(--ink-soft); }
+
+  .banner{
+    background:#fff7e0; border:1px solid #e8d38a; color:#6b5a11;
+    padding:10px 14px; border-radius:8px; font-size:13.5px;
+  }
+  .banner.error{ background:#fdecec; border-color:#f0b3b3; color:#8a1f1f; }
+
+  .results-grid{ display:grid; grid-template-columns:1fr 1.15fr; gap:16px; align-items:start; }
+  @media (max-width: 880px){ .results-grid{ grid-template-columns:1fr; } }
+
+  .summary-panel, .visual-panel, .details-panel{
+    background:var(--panel); border:1px solid var(--border); border-radius:10px; padding:14px;
+  }
+  .panel-header{ display:flex; justify-content:space-between; align-items:center; margin-bottom:8px; }
+  .panel-header h2{ margin:0; font-size:14px; text-transform:uppercase; letter-spacing:.6px; color:var(--ink-soft); }
+
+  #summaryText{
+    white-space:pre-wrap; font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+    font-size:12.8px; line-height:1.55; margin:0; max-height:560px; overflow:auto;
+  }
+
+  .view-tabs{ display:flex; gap:6px; }
+  .tab-btn{ padding:6px 10px; font-size:12.5px; border-radius:6px; }
+  .tab-btn.active{ background:var(--accent); color:#fff; border-color:var(--accent); }
+
+  .legend{ display:flex; gap:16px; font-size:12.5px; color:var(--ink-soft); margin:6px 0 10px; }
+  .legend .sw{ display:inline-block; width:11px; height:11px; border-radius:2px; margin-right:5px; vertical-align:-1px; }
+  .sw.gray{ background:#5a5a5a; } .sw.red{ background:var(--red); } .sw.blue{ background:var(--blue); }
+
+  .canvas-wrap{ border:1px solid var(--border); border-radius:6px; overflow:auto; max-height:640px; background:#fafbfc; }
+  #viewCanvas{ display:block; width:100%; height:auto; }
+
+  .slider-wrap{ display:flex; flex-direction:column; gap:8px; }
+  .slider-stack{ position:relative; width:100%; border:1px solid var(--border); border-radius:6px; overflow:hidden; background:#fafbfc; }
+  .slider-stack canvas{ position:absolute; top:0; left:0; width:100%; height:100%; display:block; }
+  .slider-line{ position:absolute; top:0; bottom:0; width:2px; background:var(--accent); left:50%; pointer-events:none; }
+  #sliderRange{ width:100%; }
+
+  table{ width:100%; border-collapse:collapse; font-size:13px; }
+  thead th{ text-align:left; color:var(--ink-soft); font-size:11.5px; text-transform:uppercase; letter-spacing:.4px; border-bottom:1px solid var(--border); padding:6px 8px; }
+  tbody td{ padding:6px 8px; border-bottom:1px solid #eef1f4; vertical-align:top; }
+  tbody td.empty{ text-align:center; color:var(--ink-soft); padding:16px; }
+
+  dialog{ border:none; border-radius:10px; padding:18px; max-width:min(94vw, 960px); box-shadow:0 12px 40px rgba(0,0,0,.25); }
+  dialog::backdrop{ background:rgba(20,30,40,.55); }
+  dialog h2{ margin-top:0; font-size:16px; }
+  dialog p{ font-size:13.5px; color:var(--ink-soft); }
+  .calib-canvas-wrap{ position:relative; border:1px solid var(--border); border-radius:6px; overflow:hidden; }
+  .calib-canvas-wrap canvas{ display:block; width:100%; height:auto; }
+  #calibOverlay{ position:absolute; top:0; left:0; cursor:crosshair; }
+  .calib-actions{ display:flex; justify-content:flex-end; gap:8px; margin-top:12px; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>Drawing Revision Comparator</h1>
+  <p class="subtitle">Drop two PDF exports of the same drawing (old vs. new revision) to get a visual diff and a written change summary. Everything runs in your browser — files are never uploaded.</p>
+</header>
+
+<main>
+  <section class="upload-row">
+    <div class="file-card" id="cardA">
+      <h2>Previous Revision</h2>
+      <div class="dropzone" id="dropA">
+        <input type="file" id="inputA" accept="application/pdf" hidden>
+        <p class="drop-hint">Drop PDF here or click to browse</p>
+        <div class="file-meta" id="metaA"></div>
+      </div>
+      <div class="page-picker" id="pagePickerA" hidden>
+        Page: <select id="pageSelectA"></select>
+      </div>
+      <div class="text-diag" id="textDiagA"></div>
+    </div>
+
+    <div class="swap-col">
+      <button id="swapBtn" title="Swap old/new">&#8646;</button>
+    </div>
+
+    <div class="file-card" id="cardB">
+      <h2>New Revision</h2>
+      <div class="dropzone" id="dropB">
+        <input type="file" id="inputB" accept="application/pdf" hidden>
+        <p class="drop-hint">Drop PDF here or click to browse</p>
+        <div class="file-meta" id="metaB"></div>
+      </div>
+      <div class="page-picker" id="pagePickerB" hidden>
+        Page: <select id="pageSelectB"></select>
+      </div>
+      <div class="text-diag" id="textDiagB"></div>
+    </div>
+  </section>
+
+  <section class="controls-row">
+    <button id="calibrateBtn" disabled>Set Title Block Region</button>
+    <span id="regionStatus" class="hint"></span>
+    <span style="flex:1"></span>
+    <button id="compareBtn" disabled>Compare Revisions</button>
+  </section>
+
+  <section id="statusBanner" class="banner" hidden></section>
+
+  <section id="results" hidden>
+    <div class="results-grid">
+      <div class="summary-panel">
+        <div class="panel-header">
+          <h2>Summary</h2>
+          <button id="copyBtn">Copy</button>
+        </div>
+        <pre id="summaryText"></pre>
+      </div>
+
+      <div class="visual-panel">
+        <div class="panel-header">
+          <h2>Visual Diff</h2>
+          <div class="view-tabs">
+            <button class="tab-btn active" data-mode="diff">Overlay Diff</button>
+            <button class="tab-btn" data-mode="slider">Slider</button>
+            <button class="tab-btn" data-mode="old">Old Only</button>
+            <button class="tab-btn" data-mode="new">New Only</button>
+          </div>
+        </div>
+        <div class="legend">
+          <span><i class="sw gray"></i>Unchanged</span>
+          <span><i class="sw red"></i>Removed (old only)</span>
+          <span><i class="sw blue"></i>Added (new only)</span>
+        </div>
+        <div class="canvas-wrap">
+          <canvas id="viewCanvas"></canvas>
+          <div class="slider-wrap" id="sliderWrap" hidden>
+            <div class="slider-stack">
+              <canvas id="sliderOld"></canvas>
+              <canvas id="sliderNew"></canvas>
+              <div class="slider-line" id="sliderLine"></div>
+            </div>
+          </div>
+        </div>
+        <div id="sliderRangeWrap" hidden style="margin-top:8px;">
+          <input type="range" id="sliderRange" min="0" max="100" value="50">
+        </div>
+      </div>
+    </div>
+
+    <div class="details-panel" style="margin-top:16px;">
+      <h2 style="font-size:14px;text-transform:uppercase;letter-spacing:.6px;color:var(--ink-soft);margin-top:0;">Detected Text / Annotation Changes</h2>
+      <table id="detailsTable">
+        <thead><tr><th>Type</th><th>Old Value</th><th>New Value</th><th>Location</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </section>
+</main>
+
+<dialog id="calibDialog">
+  <h2>Define Title Block Region</h2>
+  <p>Drag a rectangle over the title block (revision, date, drawn-by, etc.) on the reference sheet below. This region is saved in your browser and reused for future comparisons.</p>
+  <div class="calib-canvas-wrap">
+    <canvas id="calibBase"></canvas>
+    <canvas id="calibOverlay"></canvas>
+  </div>
+  <div class="calib-actions">
+    <button id="calibReset">Reset to Default</button>
+    <button id="calibCancel">Cancel</button>
+    <button id="calibSave" style="background:var(--accent);color:#fff;border-color:var(--accent);">Save Region</button>
+  </div>
+</dialog>
+
+<script>
+(function(){
+
+  // ---------- config ----------
+  // Distance thresholds are fractions of page width/height, not pixels/points,
+  // so they auto-scale to any page size. They do NOT auto-scale to annotation
+  // DENSITY though: a drawing with tightly packed dimension text may need
+  // smaller nearThreshold values than these to avoid matching the wrong
+  // neighboring string. Tune here if a real template mis-matches.
+  const CONFIG = {
+    renderMaxDim: 2000,
+    titleBlock: { exactPosEps: 0.008, nearThreshold: 0.035 },
+    body:       { exactPosEps: 0.004, nearThreshold: 0.02 },
+    inkLumThreshold: 200,
+    gridSize: 8,
+    summaryItemCap: 20,
+  };
+  const REGION_KEY = 'drawingCompare.titleBlockRegion.v1';
+  // Bottom-right corner is just a common-convention GUESS, not derived from
+  // any real company template — do not assume it's correct. Calibrating via
+  // the "Set Title Block Region" button (openCalibration) overrides this and
+  // persists to localStorage; that calibration is effectively mandatory for
+  // a template this tool hasn't seen before.
+  const DEFAULT_REGION = { x0:0.62, y0:0.80, x1:1.0, y1:1.0 };
+
+  if (typeof pdfjsLib !== 'undefined') {
+    pdfjsLib.GlobalWorkerOptions.workerSrc =
+      'https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/legacy/build/pdf.worker.min.js';
+  }
+
+  // ---------- state ----------
+  const state = { A: emptySlot(), B: emptySlot() };
+  let currentResult = null;
+
+  function emptySlot(){ return { file:null, pdf:null, numPages:0, pageNum:1 }; }
+
+  // ---------- helpers: dom ----------
+  const $ = (id) => document.getElementById(id);
+
+  function setStatus(msg, isError){
+    const el = $('statusBanner');
+    if(!msg){ el.hidden = true; return; }
+    el.hidden = false; el.textContent = msg; el.classList.toggle('error', !!isError);
+  }
+
+  function escapeHtml(s){
+    return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+  }
+
+  // ---------- pdf loading ----------
+  async function handleFile(slotKey, file){
+    if(!(file.type === 'application/pdf' || file.name.toLowerCase().endsWith('.pdf'))){
+      setStatus('Please select a PDF file.', true);
+      return;
+    }
+    setStatus('Loading ' + file.name + '…');
+    try{
+      const buf = await file.arrayBuffer();
+      const pdf = await pdfjsLib.getDocument({ data: buf }).promise;
+      const slot = state[slotKey];
+      slot.file = file; slot.pdf = pdf; slot.numPages = pdf.numPages; slot.pageNum = 1;
+      updateMeta(slotKey);
+      updatePagePicker(slotKey);
+      checkReady();
+      setStatus(null);
+      updateTextDiagnostic(slotKey);
+    } catch(err){
+      console.error(err);
+      setStatus('Could not read "' + file.name + '": ' + err.message, true);
+    }
+  }
+
+  function updateMeta(slotKey){
+    const slot = state[slotKey];
+    $('meta' + slotKey).textContent = slot.file
+      ? `${slot.file.name} — ${slot.numPages} page${slot.numPages > 1 ? 's' : ''}`
+      : '';
+  }
+
+  function updatePagePicker(slotKey){
+    const slot = state[slotKey];
+    const wrap = $('pagePicker' + slotKey);
+    const sel = $('pageSelect' + slotKey);
+    if(slot.numPages > 1){
+      sel.innerHTML = '';
+      for(let i = 1; i <= slot.numPages; i++){
+        const opt = document.createElement('option');
+        opt.value = i; opt.textContent = 'Page ' + i;
+        sel.appendChild(opt);
+      }
+      wrap.hidden = false;
+      sel.onchange = () => { slot.pageNum = parseInt(sel.value, 10); updateTextDiagnostic(slotKey); };
+    } else {
+      wrap.hidden = true;
+    }
+  }
+
+  // Safety net for the #1 failure mode (see header notes): if a CAD export
+  // flattens text to vector outlines instead of embedding it, getTextContent()
+  // silently returns nothing and the whole text/title-block diff would
+  // otherwise report "no changes" even when things changed, with no
+  // indication anything's wrong. This runs right after load so that's never
+  // silent — a 0-count here means trust the visual diff only for this file.
+  async function updateTextDiagnostic(slotKey){
+    const slot = state[slotKey];
+    const el = $('textDiag' + slotKey);
+    if(!slot.pdf){ el.textContent = ''; el.className = 'text-diag'; return; }
+    el.textContent = 'Checking for embedded text…';
+    el.className = 'text-diag';
+    try{
+      const page = await slot.pdf.getPage(slot.pageNum);
+      const tc = await page.getTextContent();
+      const count = tc.items.filter(it => (it.str || '').trim()).length;
+      if(count === 0){
+        el.textContent = '⚠ No embedded text found on this page — it may be flattened to outlines or scanned. Title block & text diff will show nothing; only the visual diff will be meaningful.';
+        el.className = 'text-diag warn';
+      } else {
+        el.textContent = `✓ ${count} text item${count === 1 ? '' : 's'} detected — text/dimension diff available.`;
+        el.className = 'text-diag ok';
+      }
+    } catch(err){
+      el.textContent = '';
+      el.className = 'text-diag';
+    }
+  }
+
+  function checkReady(){
+    $('compareBtn').disabled = !(state.A.pdf && state.B.pdf);
+    $('calibrateBtn').disabled = !state.A.pdf;
+  }
+
+  function wireDropzone(slotKey){
+    const drop = $('drop' + slotKey);
+    const input = $('input' + slotKey);
+    drop.addEventListener('click', () => input.click());
+    input.addEventListener('change', () => { if(input.files[0]) handleFile(slotKey, input.files[0]); });
+    drop.addEventListener('dragover', e => { e.preventDefault(); drop.classList.add('dragover'); });
+    drop.addEventListener('dragleave', () => drop.classList.remove('dragover'));
+    drop.addEventListener('drop', e => {
+      e.preventDefault(); drop.classList.remove('dragover');
+      const f = e.dataTransfer.files[0];
+      if(f) handleFile(slotKey, f);
+    });
+  }
+
+  $('swapBtn').addEventListener('click', () => {
+    const tmp = state.A; state.A = state.B; state.B = tmp;
+    ['A','B'].forEach(k => {
+      if(state[k].file){ updateMeta(k); updatePagePicker(k); }
+      else { $('meta' + k).textContent = ''; $('pagePicker' + k).hidden = true; }
+    });
+    checkReady();
+  });
+
+  // ---------- rendering & text extraction ----------
+  async function renderPage(pdf, pageNum, targetMaxDim){
+    const page = await pdf.getPage(pageNum);
+    const base = page.getViewport({ scale: 1 });
+    const scale = targetMaxDim / Math.max(base.width, base.height);
+    const viewport = page.getViewport({ scale });
+    const canvas = document.createElement('canvas');
+    canvas.width = Math.ceil(viewport.width);
+    canvas.height = Math.ceil(viewport.height);
+    const ctx = canvas.getContext('2d', { willReadFrequently: true });
+    ctx.fillStyle = '#fff';
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    await page.render({ canvasContext: ctx, viewport }).promise;
+    return { page, viewport, canvas, baseViewport: base };
+  }
+
+  // Reads the PDF's embedded text objects (real characters + position), NOT
+  // pixels — this is what lets the diff be precise instead of a fuzzy image
+  // comparison. It only works if the source PDF actually embeds text; if the
+  // CAD tool exported text as flattened vector outlines, tc.items will be
+  // empty here and this whole diff category goes quiet (see
+  // updateTextDiagnostic, which exists specifically to surface that case).
+  async function extractTextItems(page, viewport){
+    const tc = await page.getTextContent();
+    const items = [];
+    for(const it of tc.items){
+      const str = (it.str || '').trim();
+      if(!str) continue;
+      const [x, y] = pdfjsLib.Util.applyTransform([it.transform[4], it.transform[5]], viewport.transform);
+      items.push({ str, xFrac: x / viewport.width, yFrac: y / viewport.height });
+    }
+    return items;
+  }
+
+  function inRegion(item, region){
+    return item.xFrac >= region.x0 && item.xFrac <= region.x1 &&
+           item.yFrac >= region.y0 && item.yFrac <= region.y1;
+  }
+
+  function regionLabel(xFrac, yFrac){
+    const col = xFrac < 0.34 ? 'left' : xFrac > 0.66 ? 'right' : 'center';
+    const row = yFrac < 0.34 ? 'top' : yFrac > 0.66 ? 'bottom' : 'middle';
+    if(row === 'middle' && col === 'center') return 'center';
+    if(row === 'middle') return col;
+    if(col === 'center') return row;
+    return `${row}-${col}`;
+  }
+
+  // ---------- text diffing ----------
+  // Purely geometric/string matching — knows nothing about what the drawing
+  // contains, so it's agnostic to any specific template. Greedy two-pass
+  // nearest-neighbor: exact-string-and-position first (pass 1), then
+  // position-only within a looser threshold for whatever's left (pass 2).
+  // This is a heuristic, not a guaranteed-correct assignment (see header
+  // note on occasional false "modified" pairings between unrelated items
+  // that happen to sit close together).
+  function diffTextItems(itemsA, itemsB, opts){
+    const poolA = itemsA.map(it => ({ ...it, used:false }));
+    const poolB = itemsB.map(it => ({ ...it, used:false }));
+    const unchanged = [], modified = [], removed = [], added = [];
+
+    // pass 1: same string, very close position -> unchanged
+    for(const a of poolA){
+      if(a.used) continue;
+      let best = null, bestDist = Infinity;
+      for(const b of poolB){
+        if(b.used || b.str !== a.str) continue;
+        const d = Math.hypot(a.xFrac - b.xFrac, a.yFrac - b.yFrac);
+        if(d < bestDist){ bestDist = d; best = b; }
+      }
+      if(best && bestDist <= opts.exactPosEps){
+        a.used = best.used = true;
+        unchanged.push({ str: a.str, xFrac: a.xFrac, yFrac: a.yFrac });
+      }
+    }
+
+    // pass 2: nearest neighbor within threshold -> modified
+    for(const a of poolA){
+      if(a.used) continue;
+      let best = null, bestDist = Infinity;
+      for(const b of poolB){
+        if(b.used) continue;
+        const d = Math.hypot(a.xFrac - b.xFrac, a.yFrac - b.yFrac);
+        if(d < bestDist){ bestDist = d; best = b; }
+      }
+      if(best && bestDist <= opts.nearThreshold){
+        a.used = best.used = true;
+        modified.push({ old: a.str, new: best.str, xFrac: best.xFrac, yFrac: best.yFrac });
+      }
+    }
+
+    for(const a of poolA) if(!a.used) removed.push({ str: a.str, xFrac: a.xFrac, yFrac: a.yFrac });
+    for(const b of poolB) if(!b.used) added.push({ str: b.str, xFrac: b.xFrac, yFrac: b.yFrac });
+
+    return { unchanged, modified, removed, added };
+  }
+
+  // ---------- visual diff ----------
+  // Fully generic pixel comparison — agnostic to text/vector/scan content,
+  // so this part needs no template-specific knowledge at all. It DOES assume
+  // both canvases are registered the same way (same page size, content drawn
+  // from the same origin), which holds for revisions of one drawing template
+  // but not for two unrelated/rescaled PDFs (see sizeWarning in
+  // runComparison for the one check that exists against this).
+  function computeVisualDiff(canvasA, canvasB){
+    const w = Math.max(canvasA.width, canvasB.width);
+    const h = Math.max(canvasA.height, canvasB.height);
+
+    const ta = document.createElement('canvas'); ta.width = w; ta.height = h;
+    const tactx = ta.getContext('2d'); tactx.fillStyle = '#fff'; tactx.fillRect(0,0,w,h); tactx.drawImage(canvasA,0,0);
+    const tb = document.createElement('canvas'); tb.width = w; tb.height = h;
+    const tbctx = tb.getContext('2d'); tbctx.fillStyle = '#fff'; tbctx.fillRect(0,0,w,h); tbctx.drawImage(canvasB,0,0);
+
+    const da = tactx.getImageData(0,0,w,h).data;
+    const db = tbctx.getImageData(0,0,w,h).data;
+
+    const out = document.createElement('canvas'); out.width = w; out.height = h;
+    const octx = out.getContext('2d');
+    const outImg = octx.createImageData(w,h);
+    const od = outImg.data;
+
+    const gridN = CONFIG.gridSize;
+    const gridCounts = new Array(gridN * gridN).fill(0);
+    const THRESH = CONFIG.inkLumThreshold;
+    let changedPixels = 0;
+    const total = w * h;
+
+    for(let p = 0; p < total; p++){
+      const i = p * 4;
+      const lumA = 0.299*da[i] + 0.587*da[i+1] + 0.114*da[i+2];
+      const lumB = 0.299*db[i] + 0.587*db[i+1] + 0.114*db[i+2];
+      const inkA = lumA < THRESH, inkB = lumB < THRESH;
+      let r=255,g=255,b=255;
+      if(inkA && inkB){ r=90; g=90; b=90; }
+      else if(inkA && !inkB){ r=214; g=39; b=39; changedPixels++; }
+      else if(!inkA && inkB){ r=32; g=110; b=222; changedPixels++; }
+      od[i]=r; od[i+1]=g; od[i+2]=b; od[i+3]=255;
+
+      if(inkA !== inkB){
+        const x = p % w, y = (p / w) | 0;
+        const gx = Math.min(gridN-1, Math.floor(x / w * gridN));
+        const gy = Math.min(gridN-1, Math.floor(y / h * gridN));
+        gridCounts[gy*gridN + gx]++;
+      }
+    }
+    octx.putImageData(outImg, 0, 0);
+
+    const totalChanged = gridCounts.reduce((a,b)=>a+b,0) || 1;
+    const cells = gridCounts
+      .map((c, idx) => ({ c, x: idx % gridN, y: (idx / gridN) | 0 }))
+      .filter(c => c.c > 0)
+      .sort((a,b) => b.c - a.c);
+
+    const hotspots = [];
+    const seen = new Set();
+    for(const cell of cells){
+      const label = regionLabel((cell.x+0.5)/gridN, (cell.y+0.5)/gridN);
+      if(seen.has(label)) continue;
+      seen.add(label);
+      hotspots.push({ label, share: cell.c / totalChanged });
+      if(hotspots.length >= 3) break;
+    }
+
+    return {
+      canvas: out,
+      changedFraction: changedPixels / total,
+      hotspots,
+      tempCanvasA: ta,
+      tempCanvasB: tb,
+    };
+  }
+
+  // ---------- summary text ----------
+  function capList(arr, n){
+    if(arr.length <= n) return { shown: arr, more: 0 };
+    return { shown: arr.slice(0, n), more: arr.length - n };
+  }
+
+  function buildSummary(ctx){
+    const { fileAName, fileBName, pageA, pageB, sizeWarning, tb, body, visual } = ctx;
+    const n = CONFIG.summaryItemCap;
+    const lines = [];
+    lines.push(`Comparison: ${fileAName} (page ${pageA})  →  ${fileBName} (page ${pageB})`);
+    lines.push(new Date().toLocaleString());
+    if(sizeWarning) lines.push(`⚠ ${sizeWarning}`);
+    lines.push('');
+
+    lines.push('TITLE BLOCK CHANGES');
+    if(tb.modified.length===0 && tb.added.length===0 && tb.removed.length===0){
+      lines.push('  No changes detected in the title block region.');
+    } else {
+      const m = capList(tb.modified, n);
+      for(const x of m.shown) lines.push(`  • "${x.old}" → "${x.new}"`);
+      if(m.more) lines.push(`  ...and ${m.more} more modified field(s).`);
+      const a = capList(tb.added, n);
+      for(const x of a.shown) lines.push(`  • Added: "${x.str}"`);
+      if(a.more) lines.push(`  ...and ${a.more} more added field(s).`);
+      const r = capList(tb.removed, n);
+      for(const x of r.shown) lines.push(`  • Removed: "${x.str}"`);
+      if(r.more) lines.push(`  ...and ${r.more} more removed field(s).`);
+    }
+    lines.push('');
+
+    lines.push('DRAWING CONTENT CHANGES (dimensions, notes, labels)');
+    const totalBodyChanges = body.modified.length + body.added.length + body.removed.length;
+    if(totalBodyChanges === 0){
+      lines.push('  No text/dimension changes detected outside the title block.');
+    } else {
+      if(body.modified.length){
+        lines.push(`  ${body.modified.length} value(s) changed:`);
+        const m = capList(body.modified, n);
+        for(const x of m.shown) lines.push(`    • "${x.old}" → "${x.new}"  (near ${regionLabel(x.xFrac,x.yFrac)})`);
+        if(m.more) lines.push(`    ...and ${m.more} more.`);
+      }
+      if(body.added.length){
+        lines.push(`  ${body.added.length} item(s) added:`);
+        const a = capList(body.added, n);
+        for(const x of a.shown) lines.push(`    • "${x.str}"  (near ${regionLabel(x.xFrac,x.yFrac)})`);
+        if(a.more) lines.push(`    ...and ${a.more} more.`);
+      }
+      if(body.removed.length){
+        lines.push(`  ${body.removed.length} item(s) removed:`);
+        const r = capList(body.removed, n);
+        for(const x of r.shown) lines.push(`    • "${x.str}"  (near ${regionLabel(x.xFrac,x.yFrac)})`);
+        if(r.more) lines.push(`    ...and ${r.more} more.`);
+      }
+    }
+    lines.push('');
+
+    lines.push('VISUAL DIFFERENCE');
+    lines.push(`  ${(visual.changedFraction*100).toFixed(2)}% of the drawing area differs between revisions.`);
+    if(visual.hotspots.length){
+      lines.push(`  Most affected regions: ${visual.hotspots.map(h => `${h.label} (${Math.round(h.share*100)}%)`).join(', ')}.`);
+    }
+
+    return lines.join('\n');
+  }
+
+  function populateTable(tb, body){
+    const tbody = document.querySelector('#detailsTable tbody');
+    tbody.innerHTML = '';
+    const addRows = (list, type, oldF, newF) => {
+      for(const item of list){
+        const tr = document.createElement('tr');
+        tr.innerHTML = `<td>${type}</td><td>${escapeHtml(oldF(item))}</td><td>${escapeHtml(newF(item))}</td><td>${regionLabel(item.xFrac,item.yFrac)}</td>`;
+        tbody.appendChild(tr);
+      }
+    };
+    addRows(tb.modified, 'Title Block · Modified', i=>i.old, i=>i.new);
+    addRows(tb.added, 'Title Block · Added', ()=>'—', i=>i.str);
+    addRows(tb.removed, 'Title Block · Removed', i=>i.str, ()=>'—');
+    addRows(body.modified, 'Modified', i=>i.old, i=>i.new);
+    addRows(body.added, 'Added', ()=>'—', i=>i.str);
+    addRows(body.removed, 'Removed', i=>i.str, ()=>'—');
+    if(!tbody.children.length){
+      tbody.innerHTML = '<tr><td colspan="4" class="empty">No text differences detected.</td></tr>';
+    }
+  }
+
+  // ---------- title block calibration ----------
+  // In-memory fallback so calibration still works for the current session even
+  // if persistent storage is unavailable (see saveRegion below) — e.g. some
+  // browsers restrict localStorage writes on file:// pages or in private
+  // browsing, which is exactly how this tool is typically opened.
+  let sessionRegion = null;
+
+  function loadRegion(){
+    try{ const raw = localStorage.getItem(REGION_KEY); return raw ? JSON.parse(raw) : null; }
+    catch(e){ return null; }
+  }
+  // Returns true if the region was persisted to localStorage, false if only
+  // the in-memory fallback took effect. Previously this called
+  // localStorage.setItem() with no try/catch (unlike loadRegion, which had
+  // one) — if the browser blocked the write, the exception propagated up
+  // through the Save button's click handler and silently aborted it: the
+  // dialog never closed and the status text never updated, i.e. "Save
+  // Region" appeared to do nothing at all.
+  function saveRegion(region){
+    sessionRegion = region;
+    try{
+      localStorage.setItem(REGION_KEY, JSON.stringify(region));
+      return true;
+    } catch(e){
+      console.error('Could not persist title block region to localStorage:', e);
+      return false;
+    }
+  }
+  function getActiveRegion(){ return sessionRegion || loadRegion() || DEFAULT_REGION; }
+
+  function updateRegionStatus(persisted){
+    const r = sessionRegion || loadRegion();
+    if(!r){
+      $('regionStatus').textContent = 'Title block region: using default (bottom-right) — click "Set Title Block Region" to calibrate';
+    } else if(persisted === false){
+      $('regionStatus').textContent = 'Title block region: calibrated for this session only — your browser is blocking local storage, so it will not be remembered next time';
+    } else {
+      $('regionStatus').textContent = 'Title block region: calibrated ✓';
+    }
+  }
+
+  function drawRect(overlay, rect){
+    const ctx = overlay.getContext('2d');
+    ctx.clearRect(0,0,overlay.width, overlay.height);
+    ctx.fillStyle = 'rgba(32,110,222,0.18)';
+    ctx.strokeStyle = 'rgba(32,110,222,0.9)';
+    ctx.lineWidth = 2;
+    ctx.fillRect(rect.x0, rect.y0, rect.x1-rect.x0, rect.y1-rect.y0);
+    ctx.strokeRect(rect.x0, rect.y0, rect.x1-rect.x0, rect.y1-rect.y0);
+  }
+
+  async function openCalibration(){
+    const slot = state.A;
+    if(!slot.pdf) return;
+    const { viewport, canvas } = await renderPage(slot.pdf, slot.pageNum, 900);
+    const baseCanvas = $('calibBase'), overlay = $('calibOverlay');
+    baseCanvas.width = overlay.width = canvas.width;
+    baseCanvas.height = overlay.height = canvas.height;
+    baseCanvas.getContext('2d').drawImage(canvas, 0, 0);
+
+    const existing = loadRegion();
+    const toPixels = (frac) => ({
+      x0: frac.x0*canvas.width, y0: frac.y0*canvas.height,
+      x1: frac.x1*canvas.width, y1: frac.y1*canvas.height,
+    });
+    let rect = toPixels(existing || DEFAULT_REGION);
+    drawRect(overlay, rect);
+
+    let dragging = false, startX = 0, startY = 0;
+    const getPos = (e) => {
+      const r = overlay.getBoundingClientRect();
+      return { x: (e.clientX - r.left) * (overlay.width / r.width), y: (e.clientY - r.top) * (overlay.height / r.height) };
+    };
+    overlay.onmousedown = (e) => { dragging = true; const p = getPos(e); startX = p.x; startY = p.y; rect = {x0:p.x,y0:p.y,x1:p.x,y1:p.y}; drawRect(overlay, rect); };
+    overlay.onmousemove = (e) => {
+      if(!dragging) return;
+      const p = getPos(e);
+      rect = { x0: Math.min(startX,p.x), y0: Math.min(startY,p.y), x1: Math.max(startX,p.x), y1: Math.max(startY,p.y) };
+      drawRect(overlay, rect);
+    };
+    const stopDrag = () => { dragging = false; };
+    window.addEventListener('mouseup', stopDrag, { once:false });
+
+    $('calibReset').onclick = () => { rect = toPixels(DEFAULT_REGION); drawRect(overlay, rect); };
+    $('calibCancel').onclick = () => { $('calibDialog').close(); };
+    $('calibSave').onclick = () => {
+      const region = { x0: rect.x0/canvas.width, y0: rect.y0/canvas.height, x1: rect.x1/canvas.width, y1: rect.y1/canvas.height };
+      const persisted = saveRegion(region);
+      updateRegionStatus(persisted);
+      $('calibDialog').close();
+    };
+
+    $('calibDialog').showModal();
+  }
+
+  // ---------- results / viewer ----------
+  function switchMode(mode){
+    document.querySelectorAll('.tab-btn').forEach(b => b.classList.toggle('active', b.dataset.mode === mode));
+    const viewCanvas = $('viewCanvas'), sliderWrap = $('sliderWrap'), sliderRangeWrap = $('sliderRangeWrap');
+    if(!currentResult) return;
+    if(mode === 'slider'){
+      viewCanvas.hidden = true; sliderWrap.hidden = false; sliderRangeWrap.hidden = false;
+      setupSlider(currentResult.visual.tempCanvasA, currentResult.visual.tempCanvasB);
+    } else {
+      sliderWrap.hidden = true; sliderRangeWrap.hidden = true; viewCanvas.hidden = false;
+      let src;
+      if(mode === 'diff') src = currentResult.visual.canvas;
+      else if(mode === 'old') src = currentResult.ra.canvas;
+      else src = currentResult.rb.canvas;
+      viewCanvas.width = src.width; viewCanvas.height = src.height;
+      viewCanvas.getContext('2d').drawImage(src, 0, 0);
+    }
+  }
+
+  function setupSlider(oldCanvas, newCanvas){
+    const so = $('sliderOld'), sn = $('sliderNew');
+    so.width = sn.width = oldCanvas.width;
+    so.height = sn.height = oldCanvas.height;
+    so.getContext('2d').drawImage(oldCanvas, 0, 0);
+    sn.getContext('2d').drawImage(newCanvas, 0, 0);
+    document.querySelector('.slider-stack').style.aspectRatio = `${oldCanvas.width} / ${oldCanvas.height}`;
+    updateSliderClip($('sliderRange').value);
+  }
+
+  function updateSliderClip(val){
+    $('sliderNew').style.clipPath = `inset(0 ${100-val}% 0 0)`;
+    $('sliderLine').style.left = `${val}%`;
+  }
+  $('sliderRange').addEventListener('input', e => updateSliderClip(e.target.value));
+  document.querySelectorAll('.tab-btn').forEach(b => b.addEventListener('click', () => switchMode(b.dataset.mode)));
+
+  function showResults({ summary, tb, body, visual, ra, rb }){
+    currentResult = { tb, body, visual, ra, rb };
+    $('summaryText').textContent = summary;
+    populateTable(tb, body);
+    $('results').hidden = false;
+    switchMode('diff');
+    $('results').scrollIntoView({ behavior:'smooth', block:'start' });
+  }
+
+  function fallbackCopy(text){
+    const ta = document.createElement('textarea');
+    ta.value = text;
+    ta.style.position = 'fixed';
+    ta.style.opacity = '0';
+    document.body.appendChild(ta);
+    ta.focus(); ta.select();
+    let ok = false;
+    try{ ok = document.execCommand('copy'); } catch(e){ ok = false; }
+    document.body.removeChild(ta);
+    return ok;
+  }
+
+  $('copyBtn').addEventListener('click', async () => {
+    const text = $('summaryText').textContent;
+    const btn = $('copyBtn'); const old = btn.textContent;
+    let ok = false;
+    try{
+      await navigator.clipboard.writeText(text);
+      ok = true;
+    } catch(e){
+      ok = fallbackCopy(text);
+    }
+    btn.textContent = ok ? 'Copied!' : 'Copy failed';
+    setTimeout(() => btn.textContent = old, 1200);
+  });
+
+  // ---------- main comparison ----------
+  async function runComparison(){
+    setStatus('Rendering pages…');
+    try{
+      const region = getActiveRegion();
+
+      const [ra, rb] = await Promise.all([
+        renderPage(state.A.pdf, state.A.pageNum, CONFIG.renderMaxDim),
+        renderPage(state.B.pdf, state.B.pageNum, CONFIG.renderMaxDim),
+      ]);
+
+      setStatus('Extracting text…');
+      const [itemsA, itemsB] = await Promise.all([
+        extractTextItems(ra.page, ra.viewport),
+        extractTextItems(rb.page, rb.viewport),
+      ]);
+
+      let sizeWarning = null;
+      const arA = ra.baseViewport.width / ra.baseViewport.height;
+      const arB = rb.baseViewport.width / rb.baseViewport.height;
+      if(Math.abs(arA - arB) / arA > 0.01){
+        sizeWarning = 'Page dimensions/aspect ratio differ between the two files — visual alignment is approximate.';
+      }
+
+      const tbItemsA = itemsA.filter(it => inRegion(it, region));
+      const tbItemsB = itemsB.filter(it => inRegion(it, region));
+      const bodyItemsA = itemsA.filter(it => !inRegion(it, region));
+      const bodyItemsB = itemsB.filter(it => !inRegion(it, region));
+
+      const tb = diffTextItems(tbItemsA, tbItemsB, CONFIG.titleBlock);
+      const body = diffTextItems(bodyItemsA, bodyItemsB, CONFIG.body);
+
+      setStatus('Computing visual diff…');
+      const visual = computeVisualDiff(ra.canvas, rb.canvas);
+
+      const summary = buildSummary({
+        fileAName: state.A.file.name, fileBName: state.B.file.name,
+        pageA: state.A.pageNum, pageB: state.B.pageNum,
+        sizeWarning, tb, body, visual,
+      });
+
+      showResults({ summary, tb, body, visual, ra, rb });
+      setStatus(null);
+    } catch(err){
+      console.error(err);
+      setStatus('Error: ' + err.message, true);
+    }
+  }
+
+  $('compareBtn').addEventListener('click', runComparison);
+  $('calibrateBtn').addEventListener('click', openCalibration);
+
+  // ---------- init ----------
+  wireDropzone('A'); wireDropzone('B');
+  updateRegionStatus();
+
+  if(typeof pdfjsLib === 'undefined'){
+    setStatus('Failed to load the PDF engine (pdf.js) from the CDN. Check your internet connection, then reload the page.', true);
+  }
+
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,61 @@
+%PDF-1.4
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R >>
+endobj
+2 0 obj
+<< /Type /Pages /Kids [3 0 R] /Count 1 >>
+endobj
+3 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 792 612] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>
+endobj
+4 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>
+endobj
+5 0 obj
+<< /Length 971 >>
+stream
+1 w
+40 40 712 532 re S
+522 40 230 120 re S
+522 140 m 752 140 l S
+522 100 m 752 100 l S
+BT /F1 11 Tf 530 146 Td (MOUNTING BRACKET) Tj ET
+BT /F1 8 Tf 530 126 Td (DWG NO: 4471-A) Tj ET
+BT /F1 8 Tf 650 126 Td (SIZE: A3) Tj ET
+BT /F1 8 Tf 530 109 Td (SCALE: 1:2) Tj ET
+BT /F1 8 Tf 650 109 Td (REV: B) Tj ET
+BT /F1 8 Tf 530 85 Td (DATE: 2025-11-03) Tj ET
+BT /F1 8 Tf 530 68 Td (DRAWN BY: J. SMITH) Tj ET
+BT /F1 8 Tf 530 51 Td (CHECKED BY: R. LEE) Tj ET
+150 250 300 230 re S
+430 480 m 450 460 l S
+330 365 m
+330 381.568542494 316.568542494 395 300 395 c
+283.431457506 395 270 381.568542494 270 365 c
+270 348.431457506 283.431457506 335 300 335 c
+316.568542494 335 330 348.431457506 330 365 c
+S
+BT /F1 8 Tf 345 400 Td (R10 TYP) Tj ET
+BT /F1 8 Tf 390 486 Td (45° CHAMFER) Tj ET
+150 220 m 150 232 l S
+450 220 m 450 232 l S
+150 225 m 450 225 l S
+BT /F1 10 Tf 275 233 Td (120.5) Tj ET
+BT /F1 8 Tf 150 262 Td (REF ONLY) Tj ET
+BT /F1 8 Tf 150 212 Td (TOLERANCE ±0.5 UNLESS NOTED) Tj ET
+
+endstream
+endobj
+xref
+0 6
+0000000000 65535 f 
+0000000009 00000 n 
+0000000058 00000 n 
+0000000115 00000 n 
+0000000241 00000 n 
+0000000338 00000 n 
+trailer
+<< /Size 6 /Root 1 0 R >>
+startxref
+1360
+%%EOF
