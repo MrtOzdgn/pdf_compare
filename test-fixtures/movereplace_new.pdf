@@ -1,0 +1,82 @@
+%PDF-1.4
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R >>
+endobj
+2 0 obj
+<< /Type /Pages /Kids [3 0 R] /Count 1 >>
+endobj
+3 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 1200 840] /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>
+endobj
+4 0 obj
+<< /Length 2082 >>
+stream
+1 w
+50.00 50.00 1100.00 740.00 re S
+BT /F1 10 Tf 20.00 756.00 Td (A) Tj ET
+BT /F1 10 Tf 1180.00 756.00 Td (A) Tj ET
+BT /F1 10 Tf 20.00 638.40 Td (B) Tj ET
+BT /F1 10 Tf 1180.00 638.40 Td (B) Tj ET
+BT /F1 10 Tf 20.00 520.80 Td (C) Tj ET
+BT /F1 10 Tf 1180.00 520.80 Td (C) Tj ET
+BT /F1 10 Tf 20.00 403.20 Td (D) Tj ET
+BT /F1 10 Tf 1180.00 403.20 Td (D) Tj ET
+BT /F1 10 Tf 20.00 285.60 Td (E) Tj ET
+BT /F1 10 Tf 1180.00 285.60 Td (E) Tj ET
+BT /F1 10 Tf 20.00 168.00 Td (F) Tj ET
+BT /F1 10 Tf 1180.00 168.00 Td (F) Tj ET
+BT /F1 10 Tf 96.00 820.01 Td (1) Tj ET
+BT /F1 10 Tf 96.00 20.16 Td (1) Tj ET
+BT /F1 10 Tf 240.00 820.01 Td (2) Tj ET
+BT /F1 10 Tf 240.00 20.16 Td (2) Tj ET
+BT /F1 10 Tf 384.00 820.01 Td (3) Tj ET
+BT /F1 10 Tf 384.00 20.16 Td (3) Tj ET
+BT /F1 10 Tf 528.00 820.01 Td (4) Tj ET
+BT /F1 10 Tf 528.00 20.16 Td (4) Tj ET
+BT /F1 10 Tf 672.00 820.01 Td (5) Tj ET
+BT /F1 10 Tf 672.00 20.16 Td (5) Tj ET
+BT /F1 10 Tf 816.00 820.01 Td (6) Tj ET
+BT /F1 10 Tf 816.00 20.16 Td (6) Tj ET
+BT /F1 10 Tf 960.00 820.01 Td (7) Tj ET
+BT /F1 10 Tf 960.00 20.16 Td (7) Tj ET
+BT /F1 10 Tf 1104.00 820.01 Td (8) Tj ET
+BT /F1 10 Tf 1104.00 20.16 Td (8) Tj ET
+820.00 60.00 320.00 215.00 re S
+820.00 210.00 m 1140.00 210.00 l S
+BT /F1 8 Tf 830.00 135.00 Td (REV) Tj ET
+BT /F1 8 Tf 880.00 135.00 Td (DATE) Tj ET
+BT /F1 8 Tf 970.00 135.00 Td (DESCRIPTION) Tj ET
+BT /F1 8 Tf 830.00 120.00 Td (B) Tj ET
+BT /F1 8 Tf 880.00 120.00 Td (2025-11-03) Tj ET
+BT /F1 8 Tf 970.00 120.00 Td (SEE NOTES) Tj ET
+BT /F1 12 Tf 830.00 190.00 Td (ACME ENGINEERING CO.) Tj ET
+BT /F1 11 Tf 830.00 172.00 Td (BRACKET MOUNT ASSY) Tj ET
+BT /F1 8 Tf 830.00 154.00 Td (DWG NO: 4471-A) Tj ET
+BT /F1 8 Tf 830.00 136.00 Td (SCALE: 1:2) Tj ET
+BT /F1 8 Tf 830.00 118.00 Td (DATE: 2025-11-03) Tj ET
+BT /F1 8 Tf 830.00 100.00 Td (DRAWN BY: J. SMITH) Tj ET
+BT /F1 8 Tf 830.00 82.00 Td (CHECKED BY: R. LEE) Tj ET
+BT /F1 8 Tf 1000.00 154.00 Td (SIZE: A2) Tj ET
+BT /F1 8 Tf 1000.00 136.00 Td (REV: B) Tj ET
+150.00 250.00 500.00 430.00 re S
+BT /F1 9 Tf 300.00 550.00 Td (NPT 1/8) Tj ET
+BT /F1 9 Tf 900.00 300.00 Td (SEE DETAIL A) Tj ET
+
+endstream
+endobj
+5 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>
+endobj
+xref
+0 6
+0000000000 65535 f 
+0000000009 00000 n 
+0000000058 00000 n 
+0000000115 00000 n 
+0000000242 00000 n 
+0000002376 00000 n 
+trailer
+<< /Size 6 /Root 1 0 R >>
+startxref
+2473
+%%EOF

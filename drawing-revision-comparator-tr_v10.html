@@ -1,0 +1,1840 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<!--
+============================================================================
+ DRAWING REVISION COMPARATOR — developer notes (read before modifying)
+============================================================================
+ Built by Claude (Anthropic) for comparing two PDF exports of the same
+ technical drawing (old revision vs. new revision) and producing a written
+ change summary + visual diff. Single static HTML file, no build step, no
+ backend — everything runs client-side in the browser for privacy (drawing
+ content never leaves the machine). The only external dependency is pdf.js,
+ loaded from a CDN <script> tag below purely to render/parse PDFs; that
+ network call fetches library code only, never the user's file contents.
+
+ v3 CHANGES (ignored regions + reference-grid coordinates)
+ -----------------------------------------------------------
+ Driven directly by real-run feedback: the old single "antet bölgesi"
+ concept diffed title-block TEXT field-by-field, and when the antet's
+ internal layout shifted even slightly, unrelated cells got paired up as
+ "modified" — e.g. a field LABEL like "Mühendis" reported as changed into
+ "Remove burrs", a completely unrelated cell's content. The fix is
+ architectural, not a better matching heuristic: title-block content is no
+ longer diffed AT ALL.
+   * ANTET GÜNCELLENMİŞTİR and every title-block value-change line are GONE.
+     The single antet region became a list of "ignored regions"
+     (openCalibration, DEFAULT_IGNORE_REGIONS, IGNORE_REGIONS_KEY) — the
+     user marks as many rectangles as needed (antet, revizyon tablosu, onay
+     imzaları, an embedded parts list, …) and everything inside every one of
+     them is dropped BEFORE either the text diff or the pixel diff ever sees
+     it (isExcluded, buildExcludeBoxes). Nothing inside is ever compared, so
+     nothing inside can ever be mismatched.
+   * Reference-grid ("satranç tahtası") detection (detectGrid): most
+     technical drawings print zone-reference letters/numbers in the sheet's
+     outer margin. This is read straight off the same embedded-text
+     extraction the rest of the tool already relies on (no image OCR — see
+     detectGrid's comment for why) and used for two things: (a) every
+     reported change is tagged with its zone, e.g. "[C-4] …", computed
+     fresh from the NEW revision on every page (a template can move the
+     grid or swap which edge carries letters vs numbers between revisions —
+     nothing here hardcodes an orientation or a direction); (b) the area
+     OUTSIDE the detected grid frame is automatically added to the
+     exclusion set on top of any manual ignore regions, since that margin
+     strip is, by drafting convention, exactly where antet-adjacent noise
+     lives. When no grid can be detected confidently (see
+     CONFIG.grid.minLabels), coordinates are simply omitted for that page —
+     runComparison surfaces which pages that happened on via the status
+     banner.
+   * Trivial changes are now filtered out of the written report even when
+     they occur outside every ignored region: date-like values (isDateLike)
+     and revision-letter/number fields (isRevisionLike) are skipped —
+     dedicated helpers because these can legitimately appear inside a note
+     or table that ISN'T inside an ignored region. Their ink is still
+     masked out of the pixel diff (see runComparison) so they can't trip
+     MODEL GÖRÜNÜMLERİ either; they're just never worth a line in the notes.
+   * Person/company-name filtering was explicitly requested but has no
+     reliable content-based signal (a name is just capitalized words, same
+     shape as plenty of real drawing text) — it is handled entirely by
+     REGION exclusion (put the signature block / company field in an
+     ignored region) rather than a name-detection heuristic, which would
+     inevitably also eat real engineering text.
+
+ v2 CHANGES (Turkish revision-note output) — the text-diff MECHANICS below
+ are still accurate; the title-block-specific parts were superseded by v3.
+ -----------------------------------------
+ - ALL pages are now compared automatically (page 1↔1, 2↔2, …) instead of
+   a single user-selected page pair. Page pickers were removed.
+ - The written summary is emitted in the fixed Turkish revision-note format
+   used on drawing revision tables:
+       MODEL GÖRÜNÜMLERİ GÜNCELLENMİŞTİR.          (pixel diff > threshold)
+       [C-4] X ÖLÇÜSÜ Y OLARAK DEĞİŞTİRİLMİŞTİR.   (modified, w/ grid tag)
+       [C-4] X İFADESİ Y OLARAK DEĞİŞTİRİLMİŞTİR.  (modified text w/o digits)
+       [C-4] A, B VE C ÖLÇÜLERİ SİLİNMİŞTİR.       (removed, grouped per zone)
+       [C-4] A, B VE C EKLENMİŞTİR.                (added, grouped per zone)
+   The "[C-4]" grid tag only appears when detectGrid succeeded for that
+   page (see v3 above); otherwise the line is printed without a tag. Page
+   headers ("SAYFA N") appear for every page with changes. Pages with no
+   detected changes are omitted entirely.
+ - "MODEL GÖRÜNÜMLERİ GÜNCELLENMİŞTİR" fires when the visual (pixel) diff
+   outside every excluded region exceeds CONFIG.visualUpdateThreshold (see
+   v2.2/v2.3 below for the anti-aliasing tolerance and text-change masking
+   that make this trigger reliable — the naive version was blunt).
+ - Page-count mismatch between revisions is reported as
+   "SAYFA N EKLENMİŞTİR." / "SAYFA N SİLİNMİŞTİR." lines at the end.
+ - The ÖLÇÜSÜ/İFADESİ wording choice is a heuristic: contains-a-digit →
+   ÖLÇÜ, otherwise İFADE. Semantic grouping like "NOT 6'DAKİ SIRA NO 1"
+   is beyond what position-based text diffing can infer — the tool reports
+   the literal strings that changed; a human still merges/rephrases lines
+   that belong together before putting them in the revision table.
+ - v2.1: text matching made reflow-proof. An edit early in a note block
+   slides every following line down; those lines are identical text at a new
+   position and are NOT changes. Identical strings now match at any
+   displacement, and "modified" pairing of non-identical strings requires
+   same-spot position OR genuine Levenshtein similarity. See diffTextItems
+   and failure modes 5/5b.
+ - v2.2 (fixes from first real-template run):
+   * Font-encoding remap: this template's CAD font stores İ/Ç/Ş as ^/!/' in
+     the PDF text layer. CHAR_MAP fixes all extracted text before diffing —
+     extend it if further characters (Ğ, Ö, Ü, …) come out garbled.
+   * Line merging (mergeIntoLines): pdf.js can split identical visual text
+     into different item boundaries between two exports, producing phantom
+     text changes. Items on one visual line are merged before diffing.
+   * Prose collapsing (splitProseChanges): changed lines with >=
+     proseMinWords words (İŞLEM / NOT açıklamaları) are no longer reported
+     verbatim; they collapse to "İŞLEM N NOTU GÜNCELLENMİŞTİR." by locating
+     the numbered item and İŞLEM/NOT header above the change. Short
+     dimension/value changes keep verbatim reporting on every page.
+   * Pixel diff gained a ±visualTolerancePx dilation tolerance — two exports
+     of an unchanged page never match pixel-for-pixel (anti-aliasing,
+     sub-pixel registration). The MODEL decision uses only the changed
+     fraction OUTSIDE every excluded region (see v3 above).
+   * Per-page raw diffs are logged to the browser console (F12) for
+     debugging, since there is no details table.
+ - v2.3 (second real-template feedback round):
+   * Quoted value format: modified lines read "ESKİ" ÖLÇÜSÜ/İFADESİ "YENİ"
+     OLARAK DEĞİŞTİRİLMİŞTİR — quotes make the value boundary unambiguous
+     for multi-word values. Trailing/leading source punctuation (e.g.
+     "BOYANACAKTIR." in the drawing) is stripped before quoting, since the
+     note sentence supplies its own final period.
+   * Page header ("SAYFA N") is shown for EVERY page with changes, including
+     page 1 — otherwise İŞLEM/NOT lines read as floating facts with no page
+     context.
+   * MODEL GÖRÜNÜMLERİ false positives fixed at the source: every detected
+     text change carves an exclusion box out of the pixel diff (see
+     buildTextChangeBoxes, textMaskPad) before the MODEL GÖRÜNÜMLERİ
+     threshold is evaluated, so a page whose only change is a value or note
+     edit doesn't trip it from that edit's own ink.
+
+ APPROACH — three independent, purely client-side diff mechanisms
+ ------------------------------------------------------------------
+ 1. TEXT / DIMENSION DIFF  (see extractTextItems, diffTextItems)
+    Uses pdf.js `page.getTextContent()` to pull the PDF's embedded text
+    objects — real characters plus their (x,y) position — NOT pixels. The
+    diff logic is purely geometric/string-based and has no idea what the
+    drawing depicts. Three-pass greedy matching, made reflow-proof (see
+    diffTextItems for rationale):
+      pass 1: identical string ANYWHERE on the page (nearest-first)
+              -> unchanged, so lines that merely slid down after an edit
+                 above them are never reported as changes
+      pass 2: leftover pair either in ~the same spot (position-only) OR
+              textually similar within a reflow-sized radius -> modified
+      pass 3: anything never matched -> added/removed
+    Only ever run on items that survive isExcluded (see #2 below) — antet
+    and other ignored content never reaches this stage.
+
+ 2. IGNORED REGIONS + AUTO-DETECTED GRID FRAME
+    (see DEFAULT_IGNORE_REGIONS, getActiveRegions, openCalibration,
+    detectGrid, isExcluded, buildExcludeBoxes)
+    Two independent, additive exclusion mechanisms decide what NEVER gets
+    diffed or reported, text or pixels:
+      (a) Manual ignore regions — the user drags rectangles over the antet,
+          revision table, signatures, or any other area, once; stored as
+          FRACTIONS of page width/height (not pixels) so they survive
+          different page sizes, and applied to every page.
+      (b) Auto-detected grid frame — detectGrid reads zone-reference
+          letters/numbers out of the page margin and treats everything
+          outside that frame as excluded too, with no user setup required.
+          Falls back to "whole page is the frame" (only (a) applies) when
+          no grid is confidently detected.
+    DEFAULT_IGNORE_REGIONS (bottom-right corner) is only a common-convention
+    GUESS, not derived from any real template — for a template with no
+    detectable reference grid, manual calibration is effectively mandatory.
+
+ 3. VISUAL / PIXEL DIFF  (see computeVisualDiff)
+    Renders both pages to canvas at equal resolution, then does per-pixel
+    luminance thresholding (dark = "ink"), composited as gray (unchanged) /
+    red (old only) / blue (new only). Fully generic — works no matter what's
+    on the page. Assumes both revisions share the same page size/registration,
+    which holds by construction for revisions of the same drawing template.
+
+ KNOWN FAILURE MODES / LIMITATIONS
+ ------------------------------------
+ 1. Flattened/outlined text: some CAD PDF export settings convert text to
+    vector curves instead of embedded text (sometimes deliberate, so
+    dimensions can't be lifted/edited downstream). When that happens,
+    getTextContent() returns nothing, and the text diff AND grid detection
+    (which also reads embedded text) both go silent — while the visual
+    diff keeps working fine. This is the failure mode most likely to bite
+    on an unfamiliar template, and it is otherwise INVISIBLE. This is
+    exactly why updateTextDiagnostic() exists: right after a file loads, it
+    reports the extracted text-item count across all pages so this is never
+    silent. If you see its "no embedded text found" warning, trust the
+    visual diff only — the written text summary cannot be meaningful.
+ 2. Threshold tuning: CONFIG.body distance thresholds are fractions of page
+    size (so they auto-scale to any page size), but a drawing with very
+    densely packed dimensions may need tighter values than what's set here,
+    to avoid matching the wrong neighboring text.
+ 3. Grid detection (detectGrid) is a heuristic over embedded text, not a
+    real drafting-standard parser: it needs >= CONFIG.grid.minLabels
+    distinct single characters consistently near one pair of edges. Dense
+    body text that happens to place lone letters/numbers very close to a
+    page edge can in principle confuse it — it's biased toward returning
+    "no grid" (coordinates simply omitted) rather than a wrong grid, but
+    cross-check unexpected/missing coordinate tags against the visual diff.
+ 4. Page-size/aspect-ratio mismatch between old/new revisions makes the
+    visual overlay only approximate (flagged per page via the status
+    banner, not corrected/re-registered).
+ 5. Matching is inherently heuristic. Two residual failure directions:
+    (a) two unrelated strings occupying the same spot across revisions can
+        still be paired as "modified" — position-only pairing is kept on
+        purpose, because a fully replaced value (G1/8 -> NPT 1/8) is often
+        too dissimilar for the similarity gate to accept;
+    (b) because identical strings now match at ANY displacement (the reflow
+        fix), a string deleted in one place and re-added somewhere unrelated
+        is treated as unchanged — pure moves are never reported.
+    Cross-check surprising results against the visual diff.
+ 5b. Reflow vs. REWRAP: the fix covers lines that slide with their text
+    intact. If an edit changes where lines BREAK inside a note, the per-line
+    strings themselves differ, and those lines will be reported as modified
+    even though the wording is the same — line-level matching cannot see
+    paragraph identity. Also note the visual (pixel) diff has no concept of
+    reflow at all: a slid note block still lights up red/blue and can trip
+    the MODEL GÖRÜNÜMLERİ threshold on its own.
+ 6. Memory: every page of both PDFs is rendered to a ~2000px canvas and
+    kept for the viewer. Fine for typical multi-sheet drawings (≤ ~15
+    pages); lower CONFIG.renderMaxDim if very long documents cause issues.
+ 7. Person/company names, and anything else antet-like, are ONLY suppressed
+    if they sit inside an ignored region or outside the detected grid frame
+    — there is no content-based name filter (see v3 notes above for why).
+    If a name/company field lives somewhere neither mechanism covers, mark
+    it as an extra ignored region.
+============================================================================
+-->
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Çizim Revizyon Karşılaştırıcı</title>
+<script src="https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/legacy/build/pdf.min.js"></script>
+<style>
+  :root{
+    --bg:#f4f6f9; --panel:#ffffff; --ink:#1c2733; --ink-soft:#5b6774;
+    --accent:#1e5fa8; --accent-soft:#eaf1fb; --border:#d7dee6;
+    --red:#d62727; --blue:#206ede; --gray-mid:#5a5a5a; --green:#1f8a4c;
+  }
+  *{box-sizing:border-box;}
+  body{
+    margin:0; background:var(--bg); color:var(--ink);
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  }
+  header{ padding:24px 32px 8px; display:flex; align-items:flex-start; gap:10px; }
+  header .header-text{ flex:1; }
+  header h1{ margin:0 0 4px; font-size:22px; letter-spacing:.2px; display:flex; align-items:center; gap:8px; }
+  header .subtitle{ margin:0; color:var(--ink-soft); font-size:14px; }
+  main{ max-width:1200px; margin:0 auto; padding:16px 32px 60px; }
+
+  section{ margin-bottom:20px; }
+
+  .upload-row{ display:flex; align-items:stretch; gap:14px; }
+  .swap-col{ display:flex; align-items:center; }
+  #swapBtn{
+    width:40px; height:40px; border-radius:50%; border:1px solid var(--border);
+    background:var(--panel); font-size:18px; cursor:pointer; color:var(--accent);
+  }
+  #swapBtn:hover{ background:var(--accent-soft); }
+
+  .file-card{
+    flex:1; background:var(--panel); border:1px solid var(--border); border-radius:10px;
+    padding:14px; display:flex; flex-direction:column; gap:8px;
+  }
+  .file-card h2{ margin:0; font-size:14px; text-transform:uppercase; letter-spacing:.6px; color:var(--ink-soft); }
+  .dropzone{
+    border:2px dashed var(--border); border-radius:8px; padding:22px 12px;
+    text-align:center; cursor:pointer; transition:.15s; min-height:70px;
+  }
+  .dropzone:hover, .dropzone.dragover{ border-color:var(--accent); background:var(--accent-soft); }
+  .drop-hint{ margin:0; color:var(--ink-soft); font-size:13px; }
+  .file-meta{ margin-top:6px; font-size:13px; font-weight:600; word-break:break-all; }
+  .text-diag{ font-size:12px; margin-top:2px; }
+  .text-diag.ok{ color:var(--green); }
+  .text-diag.warn{ color:#a15c00; }
+
+  .controls-row{ display:flex; align-items:center; gap:14px; flex-wrap:wrap; }
+  button{
+    font:inherit; border:1px solid var(--border); background:var(--panel);
+    padding:9px 16px; border-radius:7px; cursor:pointer; color:var(--ink);
+  }
+  button:hover:not(:disabled){ border-color:var(--accent); color:var(--accent); }
+  button:disabled{ opacity:.45; cursor:not-allowed; }
+  #compareBtn{ background:var(--accent); color:#fff; border-color:var(--accent); font-weight:600; }
+  #compareBtn:hover:not(:disabled){ background:#174d8a; color:#fff; }
+  .hint{ font-size:13px; color:var(--ink-soft); }
+
+  /* Help ("?") buttons + shared popover */
+  .help-btn{
+    width:19px; height:19px; padding:0; border-radius:50%; font-size:12px; line-height:1;
+    display:inline-flex; align-items:center; justify-content:center;
+    color:var(--ink-soft); border-color:var(--border); flex:none;
+  }
+  .help-btn:hover{ color:var(--accent); border-color:var(--accent); background:var(--accent-soft); }
+  #helpPopover{
+    position:fixed; z-index:50; max-width:300px; background:var(--panel); color:var(--ink);
+    border:1px solid var(--border); border-radius:8px; padding:12px 14px; font-size:13px;
+    line-height:1.5; box-shadow:0 10px 30px rgba(20,30,40,.2); display:none;
+  }
+  #helpPopover.open{ display:block; }
+
+  .banner{
+    background:#fff7e0; border:1px solid #e8d38a; color:#6b5a11;
+    padding:10px 14px; border-radius:8px; font-size:13.5px; white-space:pre-wrap;
+  }
+  .banner.error{ background:#fdecec; border-color:#f0b3b3; color:#8a1f1f; }
+
+  .results-stack{ display:flex; flex-direction:column; gap:20px; }
+
+  .summary-panel, .visual-panel{
+    background:var(--panel); border:1px solid var(--border); border-radius:10px; padding:14px;
+  }
+  .panel-header{ display:flex; justify-content:space-between; align-items:center; margin-bottom:8px; gap:10px; flex-wrap:wrap; }
+  .panel-header .panel-title{ display:flex; align-items:center; gap:8px; }
+  .panel-header h2{ margin:0; font-size:14px; text-transform:uppercase; letter-spacing:.6px; color:var(--ink-soft); }
+
+  #summaryText{
+    white-space:pre-wrap; font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+    font-size:12.8px; line-height:1.7; margin:0; max-height:420px; overflow:auto;
+  }
+
+  .view-tabs{ display:flex; gap:6px; align-items:center; flex-wrap:wrap; }
+  .tab-btn{ padding:6px 10px; font-size:12.5px; border-radius:6px; }
+  .tab-btn.active{ background:var(--accent); color:#fff; border-color:var(--accent); }
+  #viewPageSelect{ font:inherit; font-size:12.5px; padding:5px 6px; border-radius:6px; border:1px solid var(--border); }
+
+  .legend{ display:flex; gap:16px; font-size:12.5px; color:var(--ink-soft); margin:6px 0; }
+  .legend .sw{ display:inline-block; width:11px; height:11px; border-radius:2px; margin-right:5px; vertical-align:-1px; }
+  .sw.gray{ background:#5a5a5a; } .sw.red{ background:var(--red); } .sw.blue{ background:var(--blue); }
+
+  .zoom-row{ display:flex; align-items:center; gap:8px; margin:0 0 10px; }
+  .zoom-row .tab-btn{ min-width:30px; text-align:center; font-weight:700; }
+  #zoomLabel{ font-size:12.5px; color:var(--ink-soft); min-width:52px; text-align:center; }
+
+  .canvas-wrap{ border:1px solid var(--border); border-radius:6px; overflow:auto; max-height:78vh; background:#fafbfc; }
+  #viewCanvas{ display:block; }
+  /* CSS gotcha guard: an author-stylesheet rule that sets `display` on an
+     element (like #viewCanvas{display:block} above, or .slider-wrap{display:
+     flex} below) overrides the browser's own `[hidden]{display:none}` rule —
+     author styles always win over user-agent styles regardless of
+     specificity. Without this, toggling `element.hidden = true` in JS looked
+     like it worked but the element stayed visible, which is exactly what
+     caused the diff view and the slider view to render on top of each other
+     (the same PDF page appearing twice, stacked, in one scrollable panel).
+     These two rules re-assert display:none with high enough specificity
+     (ID/class + [hidden]) to win. */
+  #viewCanvas[hidden]{ display:none; }
+  .slider-wrap[hidden]{ display:none; }
+
+  .slider-wrap{ display:flex; flex-direction:column; gap:8px; }
+  .slider-stack{ position:relative; border:1px solid var(--border); border-radius:6px; overflow:hidden; background:#fafbfc; }
+  .slider-stack canvas{ position:absolute; top:0; left:0; width:100%; height:100%; display:block; }
+  .slider-line{ position:absolute; top:0; bottom:0; width:2px; background:var(--accent); left:50%; pointer-events:none; }
+  #sliderRange{ width:100%; }
+
+  dialog{ border:none; border-radius:10px; padding:18px; max-width:min(94vw, 960px); box-shadow:0 12px 40px rgba(0,0,0,.25); }
+  dialog::backdrop{ background:rgba(20,30,40,.55); }
+  dialog h2{ margin-top:0; font-size:16px; }
+  dialog p{ font-size:13.5px; color:var(--ink-soft); }
+  .calib-canvas-wrap{ position:relative; border:1px solid var(--border); border-radius:6px; overflow:hidden; }
+  .calib-canvas-wrap canvas{ display:block; width:100%; height:auto; }
+  #calibOverlay{ position:absolute; top:0; left:0; cursor:crosshair; }
+  .calib-actions{ display:flex; justify-content:flex-end; gap:8px; margin-top:12px; }
+  .calib-layout{ display:flex; gap:12px; align-items:flex-start; }
+  .calib-layout .calib-canvas-wrap{ flex:1; min-width:0; }
+  .calib-region-list{ width:130px; flex:none; display:flex; flex-direction:column; gap:6px; max-height:60vh; overflow:auto; }
+  .calib-region-item{
+    display:flex; justify-content:space-between; align-items:center; gap:6px;
+    font-size:12.5px; border:1px solid var(--border); border-radius:6px; padding:5px 8px;
+  }
+  .calib-region-item button{ padding:1px 7px; font-size:12px; border-radius:5px; line-height:1.5; }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="header-text">
+    <h1>Çizim Revizyon Karşılaştırıcı</h1>
+    <p class="subtitle">Aynı çizimin iki PDF çıktısını (eski ve yeni revizyon) bırakın. Tüm sayfalar otomatik olarak karşılaştırılır ve özet, revizyon notu formatında oluşturulur. Her şey tarayıcınızda çalışır — dosyalar hiçbir yere yüklenmez.</p>
+  </div>
+  <button class="help-btn" type="button" data-help="genel" aria-label="Yardım" title="Nasıl kullanılır?">?</button>
+</header>
+
+<main>
+  <section class="upload-row">
+    <div class="file-card" id="cardA">
+      <h2>Önceki Revizyon</h2>
+      <div class="dropzone" id="dropA">
+        <input type="file" id="inputA" accept="application/pdf" hidden>
+        <p class="drop-hint">PDF'yi buraya bırakın veya seçmek için tıklayın</p>
+        <div class="file-meta" id="metaA"></div>
+      </div>
+      <div class="text-diag" id="textDiagA"></div>
+    </div>
+
+    <div class="swap-col">
+      <button id="swapBtn" title="Eski/yeniyi yer değiştir">&#8646;</button>
+    </div>
+
+    <div class="file-card" id="cardB">
+      <h2>Yeni Revizyon</h2>
+      <div class="dropzone" id="dropB">
+        <input type="file" id="inputB" accept="application/pdf" hidden>
+        <p class="drop-hint">PDF'yi buraya bırakın veya seçmek için tıklayın</p>
+        <div class="file-meta" id="metaB"></div>
+      </div>
+      <div class="text-diag" id="textDiagB"></div>
+    </div>
+  </section>
+
+  <section class="controls-row">
+    <button id="calibrateBtn" disabled>Göz Ardı Edilecek Bölgeler</button>
+    <button class="help-btn" type="button" data-help="antet" aria-label="Yardım" title="Nasıl kullanılır?">?</button>
+    <span id="regionStatus" class="hint"></span>
+    <span style="flex:1"></span>
+    <button id="compareBtn" disabled>Revizyonları Karşılaştır</button>
+  </section>
+
+  <section id="statusBanner" class="banner" hidden></section>
+
+  <section id="results" hidden>
+    <div class="results-stack">
+      <div class="summary-panel">
+        <div class="panel-header">
+          <div class="panel-title">
+            <h2>Revizyon Notları</h2>
+            <button class="help-btn" type="button" data-help="notlar" aria-label="Yardım" title="Nasıl kullanılır?">?</button>
+          </div>
+          <button id="copyBtn">Kopyala</button>
+        </div>
+        <pre id="summaryText"></pre>
+      </div>
+
+      <div class="visual-panel">
+        <div class="panel-header">
+          <div class="panel-title">
+            <h2>Görsel Fark</h2>
+            <button class="help-btn" type="button" data-help="gorsel" aria-label="Yardım" title="Nasıl kullanılır?">?</button>
+          </div>
+          <div class="view-tabs">
+            <select id="viewPageSelect" title="Sayfa"></select>
+            <button class="tab-btn active" data-mode="diff">Fark Katmanı</button>
+            <button class="tab-btn" data-mode="slider">Kaydırıcı</button>
+            <button class="tab-btn" data-mode="old">Sadece Eski</button>
+            <button class="tab-btn" data-mode="new">Sadece Yeni</button>
+          </div>
+        </div>
+        <div class="legend">
+          <span><i class="sw gray"></i>Değişmedi</span>
+          <span><i class="sw red"></i>Silindi (sadece eski)</span>
+          <span><i class="sw blue"></i>Eklendi (sadece yeni)</span>
+        </div>
+        <div class="zoom-row">
+          <button id="zoomOutBtn" class="tab-btn" title="Uzaklaştır">−</button>
+          <span id="zoomLabel">Sığdır</span>
+          <button id="zoomInBtn" class="tab-btn" title="Yakınlaştır">+</button>
+          <button id="zoomFitBtn" class="tab-btn" title="Sayfaya sığdır">Sığdır</button>
+        </div>
+        <div class="canvas-wrap">
+          <canvas id="viewCanvas"></canvas>
+          <div class="slider-wrap" id="sliderWrap" hidden>
+            <div class="slider-stack">
+              <canvas id="sliderOld"></canvas>
+              <canvas id="sliderNew"></canvas>
+              <div class="slider-line" id="sliderLine"></div>
+            </div>
+          </div>
+        </div>
+        <div id="sliderRangeWrap" hidden style="margin-top:8px;">
+          <input type="range" id="sliderRange" min="0" max="100" value="50">
+        </div>
+      </div>
+    </div>
+  </section>
+</main>
+
+<dialog id="calibDialog">
+  <h2>Göz Ardı Edilecek Bölgeler</h2>
+  <p>Referans sayfada, karşılaştırmaya dahil edilmemesi gereken alanların (antet, revizyon tablosu, onay imzaları, vb.) üzerine dikdörtgen sürükleyin. Birden fazla bölge ekleyebilirsiniz; her biri sonraki tüm karşılaştırmalarda uygulanır ve tarayıcınızda saklanır.</p>
+  <div class="calib-layout">
+    <div class="calib-canvas-wrap">
+      <canvas id="calibBase"></canvas>
+      <canvas id="calibOverlay"></canvas>
+    </div>
+    <div class="calib-region-list" id="calibRegionList"></div>
+  </div>
+  <div class="calib-actions">
+    <button id="calibReset">Varsayılana Sıfırla</button>
+    <button id="calibCancel">İptal</button>
+    <button id="calibSave" style="background:var(--accent);color:#fff;border-color:var(--accent);">Kaydet ve Kapat</button>
+  </div>
+</dialog>
+
+<div id="helpPopover" role="tooltip"></div>
+
+<script>
+(function(){
+
+  // ---------- config ----------
+  // Distance thresholds are fractions of page width/height, not pixels/points,
+  // so they auto-scale to any page size. They do NOT auto-scale to annotation
+  // DENSITY though: a drawing with tightly packed dimension text may need
+  // smaller nearThreshold values than these to avoid matching the wrong
+  // neighboring string. Tune here if a real template mis-matches.
+  const CONFIG = {
+    renderMaxDim: 2000,
+    // nearThreshold: max displacement for pairing two DIFFERENT strings as
+    //   "modified" on position alone (same annotation slot, content replaced,
+    //   e.g. G1/8 -> NPT 1/8 which is textually dissimilar).
+    // reflowThreshold: max displacement for pairing different-but-SIMILAR
+    //   strings as "modified" — catches an edited line that also slid because
+    //   of reflow above it.
+    // minSimilarity: Levenshtein similarity gate for that reflow pairing.
+    // (Only used for the drawing body — antet/ignored-region text is never
+    // diffed at all, see IGNORED REGIONS in the header notes.)
+    body: { nearThreshold: 0.02, reflowThreshold: 0.12, minSimilarity: 0.5 },
+    inkLumThreshold: 200,
+    summaryItemCap: 20,
+    // Text items on the same visual line are merged before diffing (fixes
+    // pdf.js splitting the same text differently between two exports, which
+    // produced phantom ANTET/text changes). yTol = max vertical offset,
+    // maxGap = max horizontal gap (page-width fraction) to count as one line.
+    // maxGap is deliberately tight (~0.7% of page width, about one character):
+    // pdf.js split fragments of a single string sit essentially adjacent
+    // (gap ≈ a space width), while SEPARATE dimension call-outs that happen
+    // to share a row are farther apart. Stress test T21 showed the previous
+    // 0.015 glued neighboring dimensions on densely dimensioned sheets into
+    // one long "line", which then looked like prose and collapsed the whole
+    // row into a bogus note-update label, hiding real value changes.
+    lineMerge: { yTol: 0.004, maxGap: 0.007 },
+    // Lines with at least this many words are treated as prose (İŞLEM/NOT
+    // açıklama text). Prose changes are NOT reported verbatim — they collapse
+    // to "İŞLEM N NOTU GÜNCELLENMİŞTİR." style lines. Dimension/value strings
+    // are short and stay below this limit, so they keep verbatim reporting.
+    proseMinWords: 4,
+    // Pixel-diff tolerance in pixels (at render resolution): ink in one file
+    // counts as changed only if the other file has NO ink within this radius.
+    // Kills anti-aliasing / sub-pixel registration noise between two exports,
+    // which was falsely tripping MODEL GÖRÜNÜMLERİ on unchanged pages.
+    visualTolerancePx: 2,
+    // "MODEL GÖRÜNÜMLERİ GÜNCELLENMİŞTİR." is emitted for a page when the
+    // tolerance-filtered pixel diff OUTSIDE the title block region exceeds
+    // this (fraction of total page pixels). Anti-aliasing noise is removed
+    // via visualTolerancePx, antet pixels don't count, and the areas of
+    // DETECTED TEXT CHANGES are masked out too — so a page whose only change
+    // is a dimension value or a note edit no longer trips this. What remains
+    // should be actual geometry/view change. Tune per template.
+    visualUpdateThreshold: 0.001,
+    // Padding (page-width/height fractions) around every detected text
+    // change (dimension edits, İŞLEM/NOT prose edits) used to carve an
+    // exclusion box out of the pixel diff before the MODEL GÖRÜNÜMLERİ
+    // decision. Without this, every text edit's own ink change also counts
+    // as a "visual" change and falsely triggers the line. yUp is larger
+    // than yDown because text extends upward from its baseline anchor.
+    textMaskPad: { x: 0.008, yUp: 0.02, yDown: 0.008 },
+    // Reference-grid ("satranç tahtası") detection: technical drawings
+    // frequently print a row of numbers along the top/bottom edge and a
+    // column of letters along the left/right edge (or vice versa — this is
+    // NOT assumed, see detectGrid), dividing the sheet into zones used to
+    // call out "where" a revision cloud is. marginBand is how close to a
+    // page edge (fraction of width/height) a single character has to sit to
+    // be considered a zone-label candidate rather than drawing content.
+    // framePad pulls the inferred drawing-frame boundary in slightly from
+    // the labels themselves so the label glyphs' own ink isn't counted as
+    // "inside" the frame. minLabels is how many distinct letters/numbers are
+    // required before an axis is trusted — below that, coordinates are
+    // omitted rather than guessed from noise.
+    grid: { marginBand: 0.06, framePad: 0.01, minLabels: 3 },
+  };
+  const IGNORE_REGIONS_KEY = 'drawingCompare.ignoreRegions.v1';
+  // Bottom-right corner is just a common-convention GUESS at where a title
+  // block sits, not derived from any real company template — do not assume
+  // it's correct. Users can add/remove as many rectangles as needed via
+  // "Göz Ardı Edilecek Bölgeler" (openCalibration); every rectangle here is
+  // completely excluded from BOTH the text diff and the visual/pixel diff —
+  // nothing inside is ever compared or reported, which is what stops antet
+  // fields (names, companies, dates, revision letters, signature blocks)
+  // from ever being mismatched against each other in the first place.
+  const DEFAULT_IGNORE_REGIONS = [{ x0:0.62, y0:0.80, x1:1.0, y1:1.0 }];
+
+  // This template's CAD font maps Turkish characters onto ASCII slots: the
+  // PDF text layer contains ^ ! ' where the drawing shows İ Ç Ş. All
+  // extracted text is remapped through this table before any diffing, so
+  // İŞLEM/NOT detection and the printed notes come out correct. Extend it if
+  // other characters (Ğ, Ö, Ü, …) appear garbled in the output. Caveat: this
+  // assumes ^ ! ' are never used literally on these drawings (they can't be,
+  // if the font renders them as İ Ç Ş anyway).
+  const CHAR_MAP = { '^':'İ', '!':'Ç', "'":'Ş' };
+
+  if (typeof pdfjsLib !== 'undefined') {
+    pdfjsLib.GlobalWorkerOptions.workerSrc =
+      'https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/legacy/build/pdf.worker.min.js';
+  }
+
+  // ---------- state ----------
+  const state = { A: emptySlot(), B: emptySlot() };
+  // currentResult.pages: [{ pageNum, tb, body, visual, ra, rb }]
+  let currentResult = null;
+  let currentMode = 'diff';
+  // Zoom: null = sığdır (fit to container width, the old default behavior).
+  // Otherwise a percentage of the canvas's NATURAL pixel resolution, so the
+  // user can zoom in past "fit" to inspect fine PDF detail (small dimension
+  // text, thin lines) at native/above-native resolution.
+  let zoomPct = null;
+  let naturalW = 0;
+
+  function emptySlot(){ return { file:null, pdf:null, numPages:0 }; }
+
+  // ---------- helpers: dom ----------
+  const $ = (id) => document.getElementById(id);
+
+  function setStatus(msg, isError){
+    const el = $('statusBanner');
+    if(!msg){ el.hidden = true; return; }
+    el.hidden = false; el.textContent = msg; el.classList.toggle('error', !!isError);
+  }
+
+  // ---------- pdf loading ----------
+  async function handleFile(slotKey, file){
+    if(!(file.type === 'application/pdf' || file.name.toLowerCase().endsWith('.pdf'))){
+      setStatus('Lütfen bir PDF dosyası seçin.', true);
+      return;
+    }
+    setStatus(file.name + ' yükleniyor…');
+    try{
+      const buf = await file.arrayBuffer();
+      const pdf = await pdfjsLib.getDocument({ data: buf }).promise;
+      const slot = state[slotKey];
+      slot.file = file; slot.pdf = pdf; slot.numPages = pdf.numPages;
+      updateMeta(slotKey);
+      checkReady();
+      setStatus(null);
+      updateTextDiagnostic(slotKey);
+    } catch(err){
+      console.error(err);
+      setStatus('"' + file.name + '" okunamadı: ' + err.message, true);
+    }
+  }
+
+  function updateMeta(slotKey){
+    const slot = state[slotKey];
+    $('meta' + slotKey).textContent = slot.file
+      ? `${slot.file.name} — ${slot.numPages} sayfa`
+      : '';
+  }
+
+  // Safety net for the #1 failure mode (see header notes): if a CAD export
+  // flattens text to vector outlines instead of embedding it, getTextContent()
+  // silently returns nothing and the whole text/title-block diff would
+  // otherwise report "no changes" even when things changed, with no
+  // indication anything's wrong. Now scans ALL pages (since all pages are
+  // compared) — a 0-count means trust the visual diff only for this file.
+  async function updateTextDiagnostic(slotKey){
+    const slot = state[slotKey];
+    const el = $('textDiag' + slotKey);
+    if(!slot.pdf){ el.textContent = ''; el.className = 'text-diag'; return; }
+    el.textContent = 'Gömülü metin kontrol ediliyor…';
+    el.className = 'text-diag';
+    try{
+      let total = 0;
+      const emptyPages = [];
+      for(let p = 1; p <= slot.numPages; p++){
+        const page = await slot.pdf.getPage(p);
+        const tc = await page.getTextContent();
+        const count = tc.items.filter(it => (it.str || '').trim()).length;
+        if(count === 0) emptyPages.push(p);
+        total += count;
+      }
+      if(total === 0){
+        el.textContent = '⚠ Bu dosyada gömülü metin bulunamadı — çizgilere dönüştürülmüş veya taranmış olabilir. Metin tabanlı notlar (ANTET / ÖLÇÜ satırları) üretilemez; yalnızca görsel fark ve MODEL GÖRÜNÜMLERİ satırları anlamlı olacaktır.';
+        el.className = 'text-diag warn';
+      } else if(emptyPages.length){
+        el.textContent = `⚠ ${total} metin öğesi bulundu, ancak ${emptyPages.join(', ')}. sayfa${emptyPages.length > 1 ? 'lar' : ''}da gömülü metin yok — bu sayfalar için metin notları üretilemeyecek.`;
+        el.className = 'text-diag warn';
+      } else {
+        el.textContent = `✓ ${slot.numPages} sayfada toplam ${total} metin öğesi tespit edildi — metin/ölçü farkı üretilebilir.`;
+        el.className = 'text-diag ok';
+      }
+    } catch(err){
+      el.textContent = '';
+      el.className = 'text-diag';
+    }
+  }
+
+  function checkReady(){
+    $('compareBtn').disabled = !(state.A.pdf && state.B.pdf);
+    $('calibrateBtn').disabled = !state.A.pdf;
+  }
+
+  function wireDropzone(slotKey){
+    const drop = $('drop' + slotKey);
+    const input = $('input' + slotKey);
+    drop.addEventListener('click', () => input.click());
+    input.addEventListener('change', () => { if(input.files[0]) handleFile(slotKey, input.files[0]); });
+    drop.addEventListener('dragover', e => { e.preventDefault(); drop.classList.add('dragover'); });
+    drop.addEventListener('dragleave', () => drop.classList.remove('dragover'));
+    drop.addEventListener('drop', e => {
+      e.preventDefault(); drop.classList.remove('dragover');
+      const f = e.dataTransfer.files[0];
+      if(f) handleFile(slotKey, f);
+    });
+  }
+
+  $('swapBtn').addEventListener('click', () => {
+    const tmp = state.A; state.A = state.B; state.B = tmp;
+    ['A','B'].forEach(k => {
+      $('meta' + k).textContent = '';
+      if(state[k].file) updateMeta(k);
+      updateTextDiagnostic(k);
+    });
+    checkReady();
+  });
+
+  // ---------- rendering & text extraction ----------
+  async function renderPage(pdf, pageNum, targetMaxDim){
+    const page = await pdf.getPage(pageNum);
+    const base = page.getViewport({ scale: 1 });
+    const scale = targetMaxDim / Math.max(base.width, base.height);
+    const viewport = page.getViewport({ scale });
+    const canvas = document.createElement('canvas');
+    canvas.width = Math.ceil(viewport.width);
+    canvas.height = Math.ceil(viewport.height);
+    const ctx = canvas.getContext('2d', { willReadFrequently: true });
+    ctx.fillStyle = '#fff';
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    await page.render({ canvasContext: ctx, viewport }).promise;
+    return { page, viewport, canvas, baseViewport: base };
+  }
+
+  // Reads the PDF's embedded text objects (real characters + position), NOT
+  // pixels — this is what lets the diff be precise instead of a fuzzy image
+  // comparison. It only works if the source PDF actually embeds text; if the
+  // CAD tool exported text as flattened vector outlines, tc.items will be
+  // empty here and this whole diff category goes quiet (see
+  // updateTextDiagnostic, which exists specifically to surface that case).
+  function fixEncoding(s){
+    let out = '';
+    for(const c of s) out += (CHAR_MAP[c] || c);
+    return out;
+  }
+
+  async function extractTextItems(page, viewport){
+    const tc = await page.getTextContent();
+    const raw = [];
+    for(const it of tc.items){
+      const str = fixEncoding((it.str || '').trim());
+      if(!str) continue;
+      const [x, y] = pdfjsLib.Util.applyTransform([it.transform[4], it.transform[5]], viewport.transform);
+      const wPx = (it.width || 0) * viewport.scale;
+      raw.push({ str, xFrac: x / viewport.width, yFrac: y / viewport.height, xEndFrac: (x + wPx) / viewport.width });
+    }
+    return mergeIntoLines(raw);
+  }
+
+  // pdf.js can split the SAME visual text into different item boundaries in
+  // two different exports (kerning runs, spacing, font subsetting) — diffing
+  // raw items therefore produced phantom "changes" on every run even when
+  // nothing was touched. Merging items that sit on one visual line (same y,
+  // small horizontal gap) into a single line string makes the diff
+  // segmentation-independent.
+  // Separate annotations that merely share a y coordinate are NOT merged
+  // (their gap exceeds lineMerge.maxGap).
+  function mergeIntoLines(items){
+    const yTol = CONFIG.lineMerge.yTol, maxGap = CONFIG.lineMerge.maxGap;
+    const sorted = [...items].sort((a,b) => (a.yFrac - b.yFrac) || (a.xFrac - b.xFrac));
+    const lines = [];
+    for(const it of sorted){
+      let target = null;
+      for(let i = lines.length - 1; i >= 0; i--){
+        const ln = lines[i];
+        if(it.yFrac - ln.yRef > yTol) break; // y-sorted: nothing earlier can match
+        if(Math.abs(it.yFrac - ln.yRef) <= yTol &&
+           it.xFrac - ln.xEndFrac <= maxGap &&
+           it.xFrac - ln.xEndFrac > -0.005){
+          target = ln; break;
+        }
+      }
+      if(target){
+        const gap = it.xFrac - target.xEndFrac;
+        target.str += (gap > 0.003 ? ' ' : '') + it.str;
+        target.xEndFrac = Math.max(target.xEndFrac, it.xEndFrac);
+      } else {
+        lines.push({ str: it.str, xFrac: it.xFrac, yFrac: it.yFrac, yRef: it.yFrac, xEndFrac: it.xEndFrac });
+      }
+    }
+    return lines.map(l => ({ str: l.str, xFrac: l.xFrac, yFrac: l.yFrac, xEndFrac: l.xEndFrac }));
+  }
+
+  function inRegion(item, region){
+    return item.xFrac >= region.x0 && item.xFrac <= region.x1 &&
+           item.yFrac >= region.y0 && item.yFrac <= region.y1;
+  }
+
+  // True if an item must never be diffed or reported: outside the
+  // auto-detected grid frame (frame === null means no frame was detected,
+  // so nothing is excluded on that basis), or inside any manually marked
+  // ignore region.
+  function isExcluded(item, frame, ignoreRegions){
+    if(frame && !(item.xFrac >= frame.x0 && item.xFrac <= frame.x1 &&
+                  item.yFrac >= frame.y0 && item.yFrac <= frame.y1)) return true;
+    for(const r of ignoreRegions) if(inRegion(item, r)) return true;
+    return false;
+  }
+
+  // ---------- reference-grid ("satranç tahtası") detection ----------
+  // Many drafting standards print small reference labels in the outer
+  // margin of the sheet — letters along one pair of edges, numbers along
+  // the other — splitting the page into zones so a revision cloud can be
+  // called out as e.g. "C-4" instead of a vague description. This reads
+  // those labels straight out of the SAME embedded-text extraction already
+  // used for everything else (extractTextItems) rather than doing real OCR
+  // on pixels: it's faster, and it's exactly as reliable as the rest of
+  // this tool's text diff, which already depends on embedded text being
+  // present (see updateTextDiagnostic / failure mode #1 above).
+  //
+  // Deliberately makes NO assumption about which physical edge carries
+  // letters vs numbers, or which direction they increase in — a company
+  // can (and does) change this between antet revisions. Both edge-pairs are
+  // scanned for both character types, and whichever pairing actually forms
+  // a plausible sequence (>= CONFIG.grid.minLabels distinct characters)
+  // wins; if letters and numbers are BOTH found on the same axis, or a full
+  // axis pair can't be established, grid coordinates are simply omitted for
+  // that page rather than guessed (see runComparison's per-page warning).
+  //
+  // The detected label positions also define the drawing "frame": the area
+  // inside the reference-grid border. Everything OUTSIDE that frame (the
+  // margin strip carrying the zone labels, plus whatever sits further out)
+  // is exactly the "satranç tahtasının dışındaki çeper" the tool should
+  // never diff, so it becomes an automatic exclusion in addition to any
+  // manually marked ignore regions — see buildExcludeBoxes / isExcluded.
+  function detectGrid(items){
+    const mb = CONFIG.grid.marginBand;
+    const pad = CONFIG.grid.framePad;
+    const cands = [];
+    for(const it of items){
+      const s = it.str.trim();
+      const isLetter = /^[A-Za-z]$/.test(s);
+      const isNumber = /^[0-9]{1,2}$/.test(s);
+      if(!isLetter && !isNumber) continue;
+      const inLeft = it.xFrac <= mb, inRight = it.xFrac >= 1 - mb;
+      const inTop = it.yFrac <= mb, inBottom = it.yFrac >= 1 - mb;
+      // Corners are ambiguous (could belong to either edge's sequence) and
+      // interior characters aren't margin labels at all — skip both.
+      if((inLeft || inRight ? 1 : 0) + (inTop || inBottom ? 1 : 0) !== 1) continue;
+      cands.push({
+        ch: isLetter ? s.toUpperCase() : s, isLetter,
+        edge: inLeft ? 'left' : inRight ? 'right' : inTop ? 'top' : 'bottom',
+        xFrac: it.xFrac, yFrac: it.yFrac, xEndFrac: it.xEndFrac,
+      });
+    }
+
+    const leftRight = cands.filter(c => c.edge === 'left' || c.edge === 'right');
+    const topBottom = cands.filter(c => c.edge === 'top' || c.edge === 'bottom');
+
+    // Groups candidates by character, averaging position for a char seen on
+    // both edges of a pair (e.g. the same letter printed on left AND
+    // right), then sorts by that position — physical order, NOT
+    // alphabetic/numeric order, since a template may run its labels in
+    // either direction.
+    function poolBy(arr, wantLetter, coordFn){
+      const map = new Map();
+      for(const c of arr){
+        if(c.isLetter !== wantLetter) continue;
+        if(!map.has(c.ch)) map.set(c.ch, []);
+        map.get(c.ch).push(coordFn(c));
+      }
+      return [...map.entries()]
+        .map(([ch, coords]) => ({ ch, center: coords.reduce((a,b) => a+b, 0) / coords.length }))
+        .sort((a, b) => a.center - b.center);
+    }
+
+    const vertLetters  = poolBy(leftRight, true,  c => c.yFrac);
+    const vertNumbers  = poolBy(leftRight, false, c => c.yFrac);
+    const horizLetters = poolBy(topBottom, true,  c => c.xFrac);
+    const horizNumbers = poolBy(topBottom, false, c => c.xFrac);
+
+    const MIN = CONFIG.grid.minLabels;
+    let vertAxis = null, horizAxis = null;
+    if(Math.max(vertLetters.length, vertNumbers.length) >= MIN){
+      vertAxis = vertLetters.length >= vertNumbers.length
+        ? { type:'letter', entries: vertLetters } : { type:'number', entries: vertNumbers };
+    }
+    if(Math.max(horizLetters.length, horizNumbers.length) >= MIN){
+      horizAxis = horizNumbers.length >= horizLetters.length
+        ? { type:'number', entries: horizNumbers } : { type:'letter', entries: horizLetters };
+    }
+    // Need one letter axis and one number axis — if both ended up the same
+    // type (noise) or one axis never reached MIN, there's no usable grid.
+    if(!vertAxis || !horizAxis || vertAxis.type === horizAxis.type) return null;
+
+    function boundaries(entries){
+      const b = [0];
+      for(let i = 1; i < entries.length; i++) b.push((entries[i-1].center + entries[i].center) / 2);
+      b.push(1);
+      return b;
+    }
+    const vertBounds = boundaries(vertAxis.entries);
+    const horizBounds = boundaries(horizAxis.entries);
+
+    const leftE = cands.filter(c => c.edge === 'left'), rightE = cands.filter(c => c.edge === 'right');
+    const topE = cands.filter(c => c.edge === 'top'), bottomE = cands.filter(c => c.edge === 'bottom');
+    const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
+    const frameX0 = clamp(leftE.length ? Math.max(...leftE.map(c => c.xEndFrac)) + pad : mb, 0, 0.49);
+    const frameX1 = clamp(rightE.length ? Math.min(...rightE.map(c => c.xFrac)) - pad : 1 - mb, 0.51, 1);
+    const frameY0 = clamp(topE.length ? Math.max(...topE.map(c => c.yFrac)) + pad : mb, 0, 0.49);
+    const frameY1 = clamp(bottomE.length ? Math.min(...bottomE.map(c => c.yFrac)) - pad : 1 - mb, 0.51, 1);
+
+    function cellIndex(bounds, v){
+      for(let i = 0; i < bounds.length - 1; i++) if(v >= bounds[i] && v <= bounds[i+1]) return i;
+      return v < bounds[0] ? 0 : bounds.length - 2;
+    }
+    // Always returns "LETTER-NUMBER" regardless of which physical axis each
+    // came from — the axis-orientation detection above already resolved
+    // that, so callers never need to know or care.
+    function coordFor(xFrac, yFrac){
+      const vi = cellIndex(vertBounds, yFrac), hi = cellIndex(horizBounds, xFrac);
+      const letterEntry = vertAxis.type === 'letter' ? vertAxis.entries[vi] : horizAxis.entries[hi];
+      const numberEntry = vertAxis.type === 'number' ? vertAxis.entries[vi] : horizAxis.entries[hi];
+      return letterEntry.ch + '-' + numberEntry.ch;
+    }
+
+    return {
+      frame: { x0: frameX0, y0: frameY0, x1: frameX1, y1: frameY1 },
+      coordFor,
+      letterCount: vertAxis.type === 'letter' ? vertAxis.entries.length : horizAxis.entries.length,
+      numberCount: vertAxis.type === 'number' ? vertAxis.entries.length : horizAxis.entries.length,
+    };
+  }
+
+  // Turns the auto-detected frame (see detectGrid) and the user's manually
+  // marked ignore regions into a flat list of exclusion rectangles for the
+  // pixel diff (computeVisualDiff) to mask out — the same regions that
+  // isExcluded() already keeps out of the TEXT diff. Kept as boxes (not a
+  // per-pixel predicate) so masking reuses the same fast rectangle-fill as
+  // buildTextChangeBoxes instead of a branch-per-pixel test.
+  function buildExcludeBoxes(frame, ignoreRegions){
+    const boxes = [];
+    if(frame){
+      if(frame.y0 > 0) boxes.push({ x0:0, y0:0, x1:1, y1:frame.y0 });
+      if(frame.y1 < 1) boxes.push({ x0:0, y0:frame.y1, x1:1, y1:1 });
+      if(frame.x0 > 0) boxes.push({ x0:0, y0:frame.y0, x1:frame.x0, y1:frame.y1 });
+      if(frame.x1 < 1) boxes.push({ x0:frame.x1, y0:frame.y0, x1:1, y1:frame.y1 });
+    }
+    for(const r of ignoreRegions) boxes.push({ x0:r.x0, y0:r.y0, x1:r.x1, y1:r.y1 });
+    return boxes;
+  }
+
+  // ---------- text diffing ----------
+  // Purely geometric/string matching — knows nothing about what the drawing
+  // contains, so it's agnostic to any specific template. Three greedy passes,
+  // each consuming matched items:
+  //
+  //   pass 1: identical strings are paired nearest-first with NO distance
+  //           limit and counted as unchanged. This is the REFLOW FIX: when
+  //           an edit inside a note block makes the lines below it wrap or
+  //           slide down, those lines keep their exact text but move — under
+  //           the old position-tolerance matching they fell through to the
+  //           modified/added/removed buckets and the whole block was falsely
+  //           reported as changed. Cost of the fix: a string genuinely
+  //           deleted in one place and re-added somewhere unrelated is now
+  //           silently treated as unchanged (pure moves are never reported),
+  //           which is the right tradeoff for revision notes.
+  //   pass 2: leftovers are paired as "modified" when EITHER they sit in
+  //           (nearly) the same spot (d <= nearThreshold: same annotation
+  //           slot, content replaced — e.g. G1/8 -> NPT 1/8, too dissimilar
+  //           for any text-similarity gate) OR their strings are similar
+  //           enough (Levenshtein sim >= minSimilarity) within the larger
+  //           reflowThreshold — which catches an edited line that also slid,
+  //           while stopping unrelated slid neighbors from being force-
+  //           paired the way pure nearest-neighbor used to.
+  //   pass 3: anything never matched -> added/removed.
+  //
+  // Still a heuristic, not a guaranteed-correct assignment — cross-check
+  // surprising output against the visual diff.
+  function strSimilarity(a, b){
+    if(a === b) return 1;
+    const m = a.length, n = b.length;
+    if(!m || !n) return 0;
+    let prev = new Array(n + 1);
+    for(let j = 0; j <= n; j++) prev[j] = j;
+    for(let i = 1; i <= m; i++){
+      const cur = [i];
+      for(let j = 1; j <= n; j++){
+        cur[j] = Math.min(prev[j] + 1, cur[j-1] + 1, prev[j-1] + (a[i-1] === b[j-1] ? 0 : 1));
+      }
+      prev = cur;
+    }
+    return 1 - prev[n] / Math.max(m, n);
+  }
+
+  function diffTextItems(itemsA, itemsB, opts){
+    const poolA = itemsA.map(it => ({ ...it, used:false }));
+    const poolB = itemsB.map(it => ({ ...it, used:false }));
+    const unchanged = [], modified = [], removed = [], added = [];
+    const dist = (a, b) => Math.hypot(a.xFrac - b.xFrac, a.yFrac - b.yFrac);
+
+    // pass 1: identical strings, nearest-first, no distance cap (reflow-proof).
+    // Greedy nearest-first assignment keeps duplicates ("2X", "Ø5", …) paired
+    // with their most plausible counterpart.
+    const exactPairs = [];
+    for(const a of poolA){
+      for(const b of poolB){
+        if(b.str === a.str) exactPairs.push({ a, b, d: dist(a, b) });
+      }
+    }
+    exactPairs.sort((p, q) => p.d - q.d);
+    for(const p of exactPairs){
+      if(p.a.used || p.b.used) continue;
+      p.a.used = p.b.used = true;
+      unchanged.push({ str: p.a.str, xFrac: p.a.xFrac, yFrac: p.a.yFrac, xEndFrac: p.a.xEndFrac });
+    }
+
+    // pass 2: "modified" pairing, gated by same-spot position OR content
+    // similarity. Most-similar pairs are assigned first, distance breaks ties.
+    const candPairs = [];
+    for(const a of poolA){
+      if(a.used) continue;
+      for(const b of poolB){
+        if(b.used) continue;
+        const d = dist(a, b);
+        if(d > opts.reflowThreshold) continue;
+        const sim = strSimilarity(a.str, b.str);
+        if(d > opts.nearThreshold && sim < opts.minSimilarity) continue;
+        candPairs.push({ a, b, d, sim });
+      }
+    }
+    candPairs.sort((p, q) => (q.sim - p.sim) || (p.d - q.d));
+    for(const p of candPairs){
+      if(p.a.used || p.b.used) continue;
+      p.a.used = p.b.used = true;
+      // Old-side coordinates are kept so the visual-diff text mask can cover
+      // BOTH where the text was and where it is now — an edited line that
+      // also slid leaves "removed ink" at its old spot, which used to
+      // falsely count toward MODEL GÖRÜNÜMLERİ (stress test T19).
+      modified.push({ old: p.a.str, new: p.b.str,
+        xFrac: p.b.xFrac, yFrac: p.b.yFrac, xEndFrac: p.b.xEndFrac,
+        oldXFrac: p.a.xFrac, oldYFrac: p.a.yFrac, oldXEndFrac: p.a.xEndFrac });
+    }
+
+    for(const a of poolA) if(!a.used) removed.push({ str: a.str, xFrac: a.xFrac, yFrac: a.yFrac, xEndFrac: a.xEndFrac });
+    for(const b of poolB) if(!b.used) added.push({ str: b.str, xFrac: b.xFrac, yFrac: b.yFrac, xEndFrac: b.xEndFrac });
+
+    // Redundancy guard: a value that repeats verbatim elsewhere on the same
+    // page (a dimension like "6.3" often appears at more than one call-out)
+    // can leave one occurrence paired as "modified" while its sibling
+    // occurrence, left without a partner, falls through to removed/added.
+    // The note then reads like a contradiction — "X" ÖLÇÜSÜ "Y" OLARAK
+    // DEĞİŞTİRİLMİŞTİR followed by "X" SİLİNMİŞTİR — even though they're two
+    // distinct physical occurrences. Since the note only shows the literal
+    // string, not which occurrence, showing both is more confusing than
+    // informative: drop the leftover removed/added entry whenever its exact
+    // string already appears on the old/new side of a modified pair.
+    const modOldStrs = new Set(modified.map(m => m.old));
+    const modNewStrs = new Set(modified.map(m => m.new));
+    const dedupedRemoved = removed.filter(r => !modOldStrs.has(r.str));
+    const dedupedAdded = added.filter(a => !modNewStrs.has(a.str));
+
+    return { unchanged, modified, removed: dedupedRemoved, added: dedupedAdded };
+  }
+
+  // ---------- visual diff ----------
+  // Fully generic pixel comparison — agnostic to text/vector/scan content.
+  // Two exports of the SAME unchanged page never match pixel-for-pixel:
+  // anti-aliasing and sub-pixel registration shift every stroke edge by a
+  // pixel or so, which used to count as "change" and falsely trip the MODEL
+  // GÖRÜNÜMLERİ line. Fix #1: ink in one file only counts as changed if the
+  // other file has NO ink within visualTolerancePx (dilation-based
+  // tolerance). Fix #2 (this revision): every text change ALREADY reported
+  // by the text diff (dimension edits, İŞLEM/NOT prose edits) is carved out
+  // of the pixel count via textChangeBoxesFrac — a value or note changing
+  // is not a "model view" update and was tripping MODEL GÖRÜNÜMLERİ purely
+  // from its own ink, on pages where nothing else changed. Fix #3: pixels
+  // inside any ignored region OR outside the auto-detected grid frame
+  // (excludeBoxesFrac, see buildExcludeBoxes) are carved out the same way —
+  // antet-adjacent noise can't trip MODEL GÖRÜNÜMLERİ either.
+  // bodyChangedFraction is the masked change ratio that drives the MODEL
+  // GÖRÜNÜMLERİ decision. Still assumes both canvases share page
+  // size/registration (see the per-page aspect-ratio check in
+  // runComparison).
+  function dilate(mask, w, h, r){
+    if(r <= 0) return mask;
+    const tmp = new Uint8Array(mask.length);
+    for(let y = 0; y < h; y++){
+      const row = y * w;
+      for(let x = 0; x < w; x++){
+        let v = 0;
+        for(let dx = -r; dx <= r; dx++){
+          const xx = x + dx;
+          if(xx >= 0 && xx < w && mask[row + xx]){ v = 1; break; }
+        }
+        tmp[row + x] = v;
+      }
+    }
+    const out = new Uint8Array(mask.length);
+    for(let y = 0; y < h; y++){
+      for(let x = 0; x < w; x++){
+        let v = 0;
+        for(let dy = -r; dy <= r; dy++){
+          const yy = y + dy;
+          if(yy >= 0 && yy < h && tmp[yy * w + x]){ v = 1; break; }
+        }
+        out[y * w + x] = v;
+      }
+    }
+    return out;
+  }
+
+  // Builds padded exclusion boxes (page-fraction coords) per detected text
+  // change. yUp/yDown padding is asymmetric because a text baseline anchor
+  // sits near the bottom of the glyphs, not their vertical center. Modified
+  // items produce TWO boxes — old and new positions — since an edited line
+  // that also slid changes ink in both places (stress test T19).
+  function buildTextChangeBoxes(items){
+    const pad = CONFIG.textMaskPad;
+    const boxFor = (x, xEnd, y) => ({
+      x0: Math.min(x, xEnd) - pad.x,
+      x1: Math.max(x, xEnd) + pad.x,
+      y0: y - pad.yUp,
+      y1: y + pad.yDown,
+    });
+    const boxes = [];
+    for(const it of items){
+      boxes.push(boxFor(it.xFrac, (it.xEndFrac != null) ? it.xEndFrac : it.xFrac, it.yFrac));
+      if(it.oldXFrac != null){
+        boxes.push(boxFor(it.oldXFrac, (it.oldXEndFrac != null) ? it.oldXEndFrac : it.oldXFrac, it.oldYFrac));
+      }
+    }
+    return boxes;
+  }
+
+  // Rasterizes a list of page-fraction rectangles into a pixel mask at the
+  // diff canvas's resolution. Shared by the text-change exclusion mask
+  // (buildTextChangeBoxes) and the ignored-region/outside-frame exclusion
+  // mask (buildExcludeBoxes) — both are "don't count this pixel" boxes,
+  // just with different sources. Filled by rectangle rather than per-pixel
+  // testing, since box count per page is small (tens, not thousands).
+  function fillBoxes(boxesFrac, w, h){
+    const mask = new Uint8Array(w * h);
+    for(const box of (boxesFrac || [])){
+      const bx0 = Math.max(0, Math.floor(box.x0 * w)), bx1 = Math.min(w - 1, Math.ceil(box.x1 * w));
+      const by0 = Math.max(0, Math.floor(box.y0 * h)), by1 = Math.min(h - 1, Math.ceil(box.y1 * h));
+      for(let y = by0; y <= by1; y++){
+        const row = y * w;
+        for(let x = bx0; x <= bx1; x++) mask[row + x] = 1;
+      }
+    }
+    return mask;
+  }
+
+  function computeVisualDiff(canvasA, canvasB, excludeBoxesFrac, textChangeBoxesFrac){
+    const w = Math.max(canvasA.width, canvasB.width);
+    const h = Math.max(canvasA.height, canvasB.height);
+
+    const ta = document.createElement('canvas'); ta.width = w; ta.height = h;
+    const tactx = ta.getContext('2d'); tactx.fillStyle = '#fff'; tactx.fillRect(0,0,w,h); tactx.drawImage(canvasA,0,0);
+    const tb = document.createElement('canvas'); tb.width = w; tb.height = h;
+    const tbctx = tb.getContext('2d'); tbctx.fillStyle = '#fff'; tbctx.fillRect(0,0,w,h); tbctx.drawImage(canvasB,0,0);
+
+    const da = tactx.getImageData(0,0,w,h).data;
+    const db = tbctx.getImageData(0,0,w,h).data;
+    const THRESH = CONFIG.inkLumThreshold;
+    const total = w * h;
+
+    const maskA = new Uint8Array(total), maskB = new Uint8Array(total);
+    for(let p = 0; p < total; p++){
+      const i = p * 4;
+      if(0.299*da[i] + 0.587*da[i+1] + 0.114*da[i+2] < THRESH) maskA[p] = 1;
+      if(0.299*db[i] + 0.587*db[i+1] + 0.114*db[i+2] < THRESH) maskB[p] = 1;
+    }
+    const r = CONFIG.visualTolerancePx;
+    const dilA = dilate(maskA, w, h, r);
+    const dilB = dilate(maskB, w, h, r);
+
+    // Two independent exclusion masks: detected-text-change boxes (so an
+    // edit's own ink doesn't also count as a "model view" change) and
+    // ignored-region/outside-frame boxes (so antet-adjacent pixels never
+    // count toward MODEL GÖRÜNÜMLERİ either — see buildExcludeBoxes).
+    const textMask = fillBoxes(textChangeBoxesFrac, w, h);
+    const excludeMask = fillBoxes(excludeBoxesFrac, w, h);
+
+    const out = document.createElement('canvas'); out.width = w; out.height = h;
+    const octx = out.getContext('2d');
+    const outImg = octx.createImageData(w, h);
+    const od = outImg.data;
+
+    let bodyChanged = 0;
+    for(let p = 0; p < total; p++){
+      const i = p * 4;
+      const removedPx = maskA[p] && !dilB[p]; // ink in old, nothing nearby in new
+      const addedPx   = maskB[p] && !dilA[p]; // ink in new, nothing nearby in old
+      let r8 = 255, g8 = 255, b8 = 255;
+      if(removedPx){ r8 = 214; g8 = 39;  b8 = 39; }
+      else if(addedPx){ r8 = 32; g8 = 110; b8 = 222; }
+      else if(maskA[p] || maskB[p]){ r8 = 90; g8 = 90; b8 = 90; }
+      od[i] = r8; od[i+1] = g8; od[i+2] = b8; od[i+3] = 255;
+
+      const changedPx = removedPx || addedPx;
+      if(changedPx && !textMask[p] && !excludeMask[p]) bodyChanged++;
+    }
+    octx.putImageData(outImg, 0, 0);
+
+    return {
+      canvas: out,
+      bodyChangedFraction: bodyChanged / total,
+      tempCanvasA: ta,
+      tempCanvasB: tb,
+    };
+  }
+
+  // ---------- prose (İŞLEM / NOT) change collapsing ----------
+  // Line-by-line diffs of paragraph text are noise: a rewrapped açıklama
+  // produces a wall of nonsense "İFADESİ ... OLARAK DEĞİŞTİRİLMİŞTİR" lines.
+  // So any changed line with >= proseMinWords words is treated as prose and
+  // collapsed to a single "İŞLEM N NOTU GÜNCELLENMİŞTİR." per note item.
+  // The label is found structurally: nearest line at/above the change, in
+  // roughly the same column, that starts with an item number ("1.", "2)" …),
+  // plus the nearest İŞLEM/NOT section header above for the type word.
+  // Falls back to a generic per-page line when no structure is found.
+  // Dimension/value strings are short and never hit proseMinWords, so they
+  // keep verbatim reporting on every page.
+  function isProse(str){
+    const words = str.trim().split(/\s+/);
+    if(words.length < CONFIG.proseMinWords) return false;
+    // Defense-in-depth for dense sheets: even if separate numeric call-outs
+    // ever get glued into one long "line", a string whose words are mostly
+    // numeric/dimension-like ("12.3", "Ø14", "10X6.5") is measurement data,
+    // not açıklama prose — collapsing it into a note label would hide real
+    // value changes (stress test T21). Prose requires a majority of wordy
+    // (letter-bearing, not digit-leading) tokens.
+    const wordy = words.filter(w => /^[^\d]/.test(w) && /[A-Za-zÇĞİÖŞÜçğıöşü]{2,}/.test(w)).length;
+    return wordy >= words.length / 2;
+  }
+
+  function findNoteLabel(lines, cx, cy, coordFor){
+    let bestNum = null, bestNumDy = Infinity;
+    let bestType = null, bestTypeDy = Infinity;
+    for(const ln of lines){
+      const dy = cy - ln.yFrac;           // >0: line is above the change
+      if(dy < -0.005 || dy > 0.4) continue;
+      const dx = cx - ln.xFrac;           // heading/number sits at/left of text
+      if(dx < -0.15 || dx > 0.30) continue;
+      const numMatch = ln.str.match(/^(\d{1,2})[\.\)\-:]?(\s|$)/);
+      if(numMatch && dy < bestNumDy){ bestNumDy = dy; bestNum = numMatch[1]; }
+      // Type must come from a HEADER-like line: short (not prose) and
+      // STARTING with İŞLEM/NOT. A substring match anywhere was wrong —
+      // note body text like "ISIL İŞLEM GÖRECEK..." made every nearby
+      // change label as İŞLEM even under a NOTLAR heading (stress test T4).
+      const s = ln.str.toLocaleUpperCase('tr-TR').trim();
+      const headerMatch = !isProse(ln.str) && s.match(/^(İŞLEM|NOT)(LER|LAR)?\b/);
+      if(headerMatch && dy < bestTypeDy){ bestTypeDy = dy; bestType = headerMatch[1]; }
+    }
+    const tag = coordFor ? '[' + coordFor(cx, cy) + '] ' : '';
+    if(bestType && bestNum !== null) return `${tag}${bestType} ${bestNum} NOTU GÜNCELLENMİŞTİR.`;
+    if(bestNum !== null) return `${tag}NOT ${bestNum} GÜNCELLENMİŞTİR.`;
+    if(bestType === 'İŞLEM') return `${tag}İŞLEM NOTLARI GÜNCELLENMİŞTİR.`;
+    if(bestType === 'NOT') return `${tag}NOTLAR GÜNCELLENMİŞTİR.`;
+    return `${tag}AÇIKLAMA NOTLARI GÜNCELLENMİŞTİR.`;
+  }
+
+  // Splits a body diff into (a) short value changes to keep verbatim and
+  // (b) prose changes collapsed to deduplicated note labels. coordFor is
+  // the active page's grid-coordinate lookup (see detectGrid), or null when
+  // no grid was detected for this page — findNoteLabel omits the tag then.
+  function splitProseChanges(diff, linesOld, linesNew, coordFor){
+    const keep = { unchanged: diff.unchanged, modified:[], added:[], removed:[] };
+    const proseHits = [];
+    for(const m of diff.modified){
+      if(isProse(m.old) || isProse(m.new)) proseHits.push({ x:m.xFrac, y:m.yFrac, lines: linesNew });
+      else keep.modified.push(m);
+    }
+    for(const a of diff.added){
+      if(isProse(a.str)) proseHits.push({ x:a.xFrac, y:a.yFrac, lines: linesNew });
+      else keep.added.push(a);
+    }
+    for(const r of diff.removed){
+      if(isProse(r.str)) proseHits.push({ x:r.xFrac, y:r.yFrac, lines: linesOld });
+      else keep.removed.push(r);
+    }
+    const seen = new Set(), labels = [];
+    for(const hit of proseHits){
+      const label = findNoteLabel(hit.lines, hit.x, hit.y, coordFor);
+      if(!seen.has(label)){ seen.add(label); labels.push(label); }
+    }
+    return { keep, noteLabels: labels.sort() };
+  }
+
+  // ---------- Turkish revision-note summary ----------
+  // Emits the fixed note format used on drawing revision tables. Wording
+  // heuristic: a string containing a digit is treated as a dimension
+  // ("ÖLÇÜ..."), otherwise as text ("İFADE..."). Semantic grouping (e.g.
+  // knowing that removed "1" belonged to "NOT 6") is beyond position-based
+  // diffing — the notes list the literal changed strings; merge/rephrase by
+  // hand where needed before copying into the drawing.
+  function trUpper(s){ return String(s).toLocaleUpperCase('tr-TR'); }
+  function hasDigit(s){ return /\d/.test(s); }
+
+  // Changes the tool should never bother reporting even when they occur
+  // outside every ignored region (a date or revision letter can legitimately
+  // sit inside a notes table, not just the antet) — see the user-facing
+  // request to drop date and revision-letter churn from the notes.
+  // Deliberately narrow regexes: better to under-suppress (report a
+  // date-shaped change verbatim once in a while) than to eat a real
+  // dimension that happens to look date-shaped.
+  const TR_MONTHS = 'OCAK|ŞUBAT|MART|NİSAN|MAYIS|HAZİRAN|TEMMUZ|AĞUSTOS|EYLÜL|EKİM|KASIM|ARALIK';
+  const DATE_RES = [
+    /^\d{1,2}[.\/\-]\d{1,2}[.\/\-]\d{2,4}$/,
+    /^\d{4}[.\/\-]\d{1,2}[.\/\-]\d{1,2}$/,
+    new RegExp('^\\d{1,2}\\s+(' + TR_MONTHS + ')\\s+\\d{2,4}$'),
+  ];
+  function isDateLike(s){
+    const t = trUpper(s).trim();
+    return DATE_RES.some(re => re.test(t));
+  }
+  function isRevisionLike(s){
+    return /^REV(İZYON)?\.?\s*[:\-]?\s*[A-Z0-9]{1,3}$/.test(trUpper(s).trim());
+  }
+  function isTrivialChange(oldStr, newStr){
+    return (isDateLike(oldStr) && isDateLike(newStr)) || isRevisionLike(oldStr) || isRevisionLike(newStr);
+  }
+
+  // Strips trailing/leading sentence punctuation from an extracted drawing
+  // value ("BOYANACAKTIR." -> "BOYANACAKTIR") — the revision-note sentence
+  // supplies its own final period, so the source drawing's punctuation is
+  // just noise inside the quotes.
+  function cleanToken(s){
+    return trUpper(s).trim().replace(/^[.,;:!?]+/, '').replace(/[.,;:!?]+$/, '');
+  }
+  // Quoted value for inline use in a note sentence, per "X" İFADESİ "Y"
+  // OLARAK DEĞİŞTİRİLMİŞTİR — quotes make the value boundary unambiguous
+  // when the value itself is multi-word.
+  function q(s){ return '"' + cleanToken(s) + '"'; }
+
+  function joinTr(strs){
+    if(strs.length === 1) return strs[0];
+    return strs.slice(0, -1).join(', ') + ' VE ' + strs[strs.length - 1];
+  }
+
+  function capList(arr, n){
+    if(arr.length <= n) return { shown: arr, more: 0 };
+    return { shown: arr.slice(0, n), more: arr.length - n };
+  }
+
+  // Grouped "[C-4] A, B VE C ÖLÇÜLERİ SİLİNMİŞTİR." style lines for
+  // added/removed, one line per grid zone (items in different zones are
+  // never combined into one sentence, even on the same page) — coordFor is
+  // null when no grid was detected for this page, in which case every item
+  // falls into a single untagged group, matching the old page-wide grouping.
+  function groupedLineByCoord(items, verb, coordFor){ // verb: 'SİLİNMİŞTİR' | 'EKLENMİŞTİR'
+    const groups = new Map();
+    for(const it of items){
+      const key = coordFor ? coordFor(it.xFrac, it.yFrac) : '';
+      if(!groups.has(key)) groups.set(key, []);
+      groups.get(key).push(it);
+    }
+    const lines = [];
+    for(const [key, arr] of groups){
+      const { shown, more } = capList(arr, CONFIG.summaryItemCap);
+      const strs = shown.map(x => q(x.str));
+      const allDims = shown.every(x => hasDigit(x.str));
+      const noun = allDims
+        ? (strs.length > 1 ? 'ÖLÇÜLERİ' : 'ÖLÇÜSÜ')
+        : (strs.length > 1 ? 'İFADELERİ' : 'İFADESİ');
+      let line = `${key ? '[' + key + '] ' : ''}${joinTr(strs)} ${noun} ${verb}.`;
+      if(more) line += ` (VE ${more} DİĞER)`;
+      lines.push(line);
+    }
+    return lines;
+  }
+
+  // Modified-value lines, quoted per value: "[C-4] ESKİ" ÖLÇÜSÜ/İFADESİ
+  // "YENİ" OLARAK DEĞİŞTİRİLMİŞTİR — coordFor is the active page's
+  // grid-coordinate lookup (see detectGrid), or null when no grid was
+  // detected for this page, in which case the tag is simply omitted.
+  function emitValueChangeLines(pageLines, diff, coordFor){
+    const m = capList(diff.modified, CONFIG.summaryItemCap);
+    for(const x of m.shown){
+      const noun = hasDigit(x.old) || hasDigit(x.new) ? 'ÖLÇÜSÜ' : 'İFADESİ';
+      const tag = coordFor ? '[' + coordFor(x.xFrac, x.yFrac) + '] ' : '';
+      pageLines.push(`${tag}${q(x.old)} ${noun} ${q(x.new)} OLARAK DEĞİŞTİRİLMİŞTİR.`);
+    }
+    if(m.more) pageLines.push(`(VE ${m.more} DİĞER DEĞİŞİKLİK)`);
+    if(diff.added.length) pageLines.push(...groupedLineByCoord(diff.added, 'EKLENMİŞTİR', coordFor));
+    if(diff.removed.length) pageLines.push(...groupedLineByCoord(diff.removed, 'SİLİNMİŞTİR', coordFor));
+  }
+
+  function buildTurkishSummary(pageResults, numPagesA, numPagesB){
+    const lines = [];
+
+    for(const pr of pageResults){
+      const pageLines = [];
+
+      // Antet/title-block text is never diffed at all (see IGNORED REGIONS
+      // in the header notes) — there is no ANTET GÜNCELLENMİŞTİR line
+      // anymore. Only engineering content survives to this point: model
+      // view changes, İŞLEM/NOT edits, and dimension/value changes.
+      if(pr.visual.bodyChangedFraction >= CONFIG.visualUpdateThreshold){
+        pageLines.push('MODEL GÖRÜNÜMLERİ GÜNCELLENMİŞTİR.');
+      }
+
+      for(const lbl of pr.noteLabels) pageLines.push(lbl);
+
+      emitValueChangeLines(pageLines, pr.body, pr.coordFor);
+
+      // Page header always shown (including page 1) so a change is never
+      // ambiguous about which sheet it's on — this matters most for İŞLEM/
+      // NOT lines, which read like a floating fact without it.
+      if(pageLines.length){
+        lines.push('SAYFA ' + pr.pageNum);
+        lines.push(...pageLines);
+      }
+    }
+
+    // Page-count mismatch → whole-page add/remove lines.
+    if(numPagesB > numPagesA){
+      for(let p = numPagesA + 1; p <= numPagesB; p++) lines.push(`SAYFA ${p} EKLENMİŞTİR.`);
+    } else if(numPagesA > numPagesB){
+      for(let p = numPagesB + 1; p <= numPagesA; p++) lines.push(`SAYFA ${p} SİLİNMİŞTİR.`);
+    }
+
+    if(!lines.length) return 'İKİ REVİZYON ARASINDA DEĞİŞİKLİK TESPİT EDİLMEMİŞTİR.';
+    return lines.join('\n');
+  }
+
+  // ---------- ignored-region calibration ----------
+  // In-memory fallback so calibration still works for the current session
+  // even if persistent storage is unavailable (see saveRegions below) — e.g.
+  // some browsers restrict localStorage writes on file:// pages or in
+  // private browsing, which is exactly how this tool is typically opened.
+  let sessionRegions = null;
+
+  function loadRegions(){
+    try{
+      const raw = localStorage.getItem(IGNORE_REGIONS_KEY);
+      if(!raw) return null;
+      const parsed = JSON.parse(raw);
+      return Array.isArray(parsed) ? parsed : [parsed]; // migrate legacy single-region format
+    } catch(e){ return null; }
+  }
+  // Returns true if the regions were persisted to localStorage, false if
+  // only the in-memory fallback took effect (browser blocked the write).
+  function saveRegions(regions){
+    sessionRegions = regions;
+    try{
+      localStorage.setItem(IGNORE_REGIONS_KEY, JSON.stringify(regions));
+      return true;
+    } catch(e){
+      console.error('Could not persist ignore regions to localStorage:', e);
+      return false;
+    }
+  }
+  function getActiveRegions(){ return sessionRegions || loadRegions() || DEFAULT_IGNORE_REGIONS; }
+
+  function updateRegionStatus(persisted){
+    const r = sessionRegions || loadRegions();
+    if(!r){
+      $('regionStatus').textContent = 'Göz ardı edilecek bölge: varsayılan (sağ alt köşe) kullanılıyor — kalibre etmek için tıklayın';
+    } else if(persisted === false){
+      $('regionStatus').textContent = `Göz ardı edilecek ${r.length} bölge yalnızca bu oturum için kaydedildi — tarayıcınız yerel depolamayı engelliyor, bir sonraki sefere hatırlanmayacak`;
+    } else {
+      $('regionStatus').textContent = `Göz ardı edilecek ${r.length} bölge tanımlı ✓`;
+    }
+  }
+
+  // label: 1-based index shown in the corner of the rectangle (or null for
+  // no label). isDraft: true while the user is still dragging out a new
+  // rectangle — drawn lighter/dashed so it reads as "not committed yet".
+  function drawRect(overlay, rect, label, isDraft){
+    const ctx = overlay.getContext('2d');
+    ctx.fillStyle = isDraft ? 'rgba(32,110,222,0.12)' : 'rgba(32,110,222,0.18)';
+    ctx.strokeStyle = isDraft ? 'rgba(32,110,222,0.6)' : 'rgba(32,110,222,0.9)';
+    ctx.lineWidth = 2;
+    ctx.setLineDash(isDraft ? [5,4] : []);
+    ctx.fillRect(rect.x0, rect.y0, rect.x1-rect.x0, rect.y1-rect.y0);
+    ctx.strokeRect(rect.x0, rect.y0, rect.x1-rect.x0, rect.y1-rect.y0);
+    ctx.setLineDash([]);
+    if(label != null){
+      ctx.fillStyle = 'rgba(20,30,40,0.85)';
+      ctx.fillRect(rect.x0, rect.y0, 20, 16);
+      ctx.fillStyle = '#fff'; ctx.font = '11px sans-serif';
+      ctx.fillText(String(label), rect.x0+5, rect.y0+12);
+    }
+  }
+
+  // Lets the user mark as many ignore rectangles as needed (antet, revision
+  // table, signatures, an inset parts list, …) instead of the old single
+  // region — every drag commits a NEW rectangle to the list, and each can be
+  // removed individually. See DEFAULT_IGNORE_REGIONS / getActiveRegions.
+  async function openCalibration(){
+    const slot = state.A;
+    if(!slot.pdf) return;
+    const { canvas } = await renderPage(slot.pdf, 1, 900);
+    const baseCanvas = $('calibBase'), overlay = $('calibOverlay');
+    baseCanvas.width = overlay.width = canvas.width;
+    baseCanvas.height = overlay.height = canvas.height;
+    baseCanvas.getContext('2d').drawImage(canvas, 0, 0);
+
+    let regions = getActiveRegions().map(r => ({ ...r }));
+    const toPixels = (r) => ({ x0:r.x0*canvas.width, y0:r.y0*canvas.height, x1:r.x1*canvas.width, y1:r.y1*canvas.height });
+    const toFrac = (r) => ({ x0:r.x0/canvas.width, y0:r.y0/canvas.height, x1:r.x1/canvas.width, y1:r.y1/canvas.height });
+
+    let draftRect = null;
+
+    function redraw(){
+      const ctx = overlay.getContext('2d');
+      ctx.clearRect(0, 0, overlay.width, overlay.height);
+      regions.forEach((r, i) => drawRect(overlay, toPixels(r), i + 1, false));
+      if(draftRect) drawRect(overlay, draftRect, regions.length + 1, true);
+      renderRegionList();
+    }
+    function renderRegionList(){
+      const list = $('calibRegionList');
+      list.innerHTML = '';
+      if(!regions.length){
+        const p = document.createElement('p');
+        p.className = 'hint'; p.style.margin = '0';
+        p.textContent = 'Henüz bölge yok. Sayfa üzerinde sürükleyerek bir bölge çizin.';
+        list.appendChild(p);
+        return;
+      }
+      regions.forEach((r, i) => {
+        const row = document.createElement('div');
+        row.className = 'calib-region-item';
+        const span = document.createElement('span');
+        span.textContent = 'Bölge ' + (i + 1);
+        const del = document.createElement('button');
+        del.type = 'button'; del.textContent = '✕'; del.title = 'Bu bölgeyi sil';
+        del.onclick = () => { regions.splice(i, 1); redraw(); };
+        row.appendChild(span); row.appendChild(del);
+        list.appendChild(row);
+      });
+    }
+
+    let dragging = false, startX = 0, startY = 0;
+    const getPos = (e) => {
+      const r = overlay.getBoundingClientRect();
+      return { x: (e.clientX - r.left) * (overlay.width / r.width), y: (e.clientY - r.top) * (overlay.height / r.height) };
+    };
+    overlay.onmousedown = (e) => {
+      dragging = true; const p = getPos(e); startX = p.x; startY = p.y;
+      draftRect = { x0:p.x, y0:p.y, x1:p.x, y1:p.y };
+      redraw();
+    };
+    overlay.onmousemove = (e) => {
+      if(!dragging) return;
+      const p = getPos(e);
+      draftRect = { x0: Math.min(startX,p.x), y0: Math.min(startY,p.y), x1: Math.max(startX,p.x), y1: Math.max(startY,p.y) };
+      redraw();
+    };
+    const stopDrag = () => {
+      if(dragging && draftRect && draftRect.x1 - draftRect.x0 > 4 && draftRect.y1 - draftRect.y0 > 4){
+        regions.push(toFrac(draftRect));
+      }
+      dragging = false; draftRect = null; redraw();
+    };
+    window.addEventListener('mouseup', stopDrag);
+    // Dialog can be reopened many times in a session — remove this specific
+    // listener (not a fresh anonymous one) once it closes, however it
+    // closes (Save/Cancel/Esc), so listeners never pile up on window.
+    $('calibDialog').addEventListener('close', () => window.removeEventListener('mouseup', stopDrag), { once: true });
+
+    redraw();
+
+    $('calibReset').onclick = () => { regions = DEFAULT_IGNORE_REGIONS.map(r => ({ ...r })); draftRect = null; redraw(); };
+    $('calibCancel').onclick = () => { $('calibDialog').close(); };
+    $('calibSave').onclick = () => {
+      const persisted = saveRegions(regions);
+      updateRegionStatus(persisted);
+      $('calibDialog').close();
+    };
+
+    $('calibDialog').showModal();
+  }
+
+  // ---------- results / viewer ----------
+  function activePage(){
+    if(!currentResult) return null;
+    const idx = parseInt($('viewPageSelect').value, 10) || 0;
+    return currentResult.pages[Math.min(idx, currentResult.pages.length - 1)];
+  }
+
+  function switchMode(mode){
+    currentMode = mode;
+    document.querySelectorAll('.tab-btn[data-mode]').forEach(b => b.classList.toggle('active', b.dataset.mode === mode));
+    const pr = activePage();
+    if(!pr) return;
+    const viewCanvas = $('viewCanvas'), sliderWrap = $('sliderWrap'), sliderRangeWrap = $('sliderRangeWrap');
+    if(mode === 'slider'){
+      viewCanvas.hidden = true; sliderWrap.hidden = false; sliderRangeWrap.hidden = false;
+      setupSlider(pr.visual.tempCanvasA, pr.visual.tempCanvasB);
+    } else {
+      sliderWrap.hidden = true; sliderRangeWrap.hidden = true; viewCanvas.hidden = false;
+      let src;
+      if(mode === 'diff') src = pr.visual.canvas;
+      else if(mode === 'old') src = pr.ra.canvas;
+      else src = pr.rb.canvas;
+      viewCanvas.width = src.width; viewCanvas.height = src.height;
+      viewCanvas.getContext('2d').drawImage(src, 0, 0);
+      naturalW = src.width;
+      applyZoom();
+    }
+  }
+
+  function populatePageSelect(pages){
+    const sel = $('viewPageSelect');
+    sel.innerHTML = '';
+    pages.forEach((pr, idx) => {
+      const opt = document.createElement('option');
+      opt.value = idx;
+      opt.textContent = 'Sayfa ' + pr.pageNum;
+      sel.appendChild(opt);
+    });
+    sel.hidden = pages.length <= 1;
+    sel.onchange = () => switchMode(currentMode);
+  }
+
+  function setupSlider(oldCanvas, newCanvas){
+    const so = $('sliderOld'), sn = $('sliderNew');
+    so.width = sn.width = oldCanvas.width;
+    so.height = sn.height = oldCanvas.height;
+    so.getContext('2d').drawImage(oldCanvas, 0, 0);
+    sn.getContext('2d').drawImage(newCanvas, 0, 0);
+    document.querySelector('.slider-stack').style.aspectRatio = `${oldCanvas.width} / ${oldCanvas.height}`;
+    updateSliderClip($('sliderRange').value);
+    naturalW = oldCanvas.width;
+    applyZoom();
+  }
+
+  // ---------- zoom (visual diff detail inspection) ----------
+  // zoomPct === null means "sığdır" (fit width, matches the old always-100%
+  // behavior). Any other value is a percentage of the canvas's NATURAL pixel
+  // resolution (set via canvas.width = src.width, i.e. the render at
+  // CONFIG.renderMaxDim, ~2000px) — so 100% here shows the PDF at its actual
+  // rendered resolution, and higher values let the user inspect fine detail
+  // (small dimension text, thin lines) beyond what "fit to panel" shows.
+  // .canvas-wrap / .slider-stack already have overflow:auto, so once the
+  // element is wider than the panel the browser gives horizontal + vertical
+  // scrollbars for panning — no extra pan logic needed.
+  function fitPercent(){
+    const wrap = document.querySelector('.canvas-wrap');
+    if(!naturalW || !wrap || !wrap.clientWidth) return 100;
+    return Math.max(10, Math.round(wrap.clientWidth / naturalW * 100));
+  }
+  function applyZoom(){
+    const viewCanvas = $('viewCanvas');
+    const stack = document.querySelector('.slider-stack');
+    const label = $('zoomLabel');
+    if(zoomPct == null){
+      viewCanvas.style.width = '100%'; viewCanvas.style.height = 'auto';
+      if(stack) stack.style.width = '100%';
+      if(label) label.textContent = 'Sığdır';
+    } else {
+      const wpx = Math.max(20, Math.round(naturalW * (zoomPct / 100))) + 'px';
+      viewCanvas.style.width = wpx; viewCanvas.style.height = 'auto';
+      if(stack) stack.style.width = wpx;
+      if(label) label.textContent = zoomPct + '%';
+    }
+  }
+  function setZoom(pct){ zoomPct = pct; applyZoom(); }
+  $('zoomInBtn').addEventListener('click', () => setZoom(Math.min(800, (zoomPct ?? fitPercent()) + 25)));
+  $('zoomOutBtn').addEventListener('click', () => setZoom(Math.max(10, (zoomPct ?? fitPercent()) - 25)));
+  $('zoomFitBtn').addEventListener('click', () => setZoom(null));
+
+  function updateSliderClip(val){
+    $('sliderNew').style.clipPath = `inset(0 ${100-val}% 0 0)`;
+    $('sliderLine').style.left = `${val}%`;
+  }
+  $('sliderRange').addEventListener('input', e => updateSliderClip(e.target.value));
+  document.querySelectorAll('.tab-btn[data-mode]').forEach(b => b.addEventListener('click', () => switchMode(b.dataset.mode)));
+
+  function showResults(summary, pages){
+    currentResult = { pages };
+    zoomPct = null; // start each new comparison at "sığdır"
+    $('summaryText').textContent = summary;
+    populatePageSelect(pages);
+    $('results').hidden = false;
+    switchMode('diff');
+    $('results').scrollIntoView({ behavior:'smooth', block:'start' });
+  }
+
+  function fallbackCopy(text){
+    const ta = document.createElement('textarea');
+    ta.value = text;
+    ta.style.position = 'fixed';
+    ta.style.opacity = '0';
+    document.body.appendChild(ta);
+    ta.focus(); ta.select();
+    let ok = false;
+    try{ ok = document.execCommand('copy'); } catch(e){ ok = false; }
+    document.body.removeChild(ta);
+    return ok;
+  }
+
+  $('copyBtn').addEventListener('click', async () => {
+    const text = $('summaryText').textContent;
+    const btn = $('copyBtn'); const old = btn.textContent;
+    let ok = false;
+    try{
+      await navigator.clipboard.writeText(text);
+      ok = true;
+    } catch(e){
+      ok = fallbackCopy(text);
+    }
+    btn.textContent = ok ? 'Kopyalandı!' : 'Kopyalama başarısız';
+    setTimeout(() => btn.textContent = old, 1200);
+  });
+
+  // ---------- main comparison ----------
+  async function runComparison(){
+    try{
+      const ignoreRegions = getActiveRegions();
+      const nA = state.A.numPages, nB = state.B.numPages;
+      const nCommon = Math.min(nA, nB);
+      const pages = [];
+      const warnings = [];
+      const noGridPages = [];
+
+      for(let p = 1; p <= nCommon; p++){
+        setStatus(`Sayfa ${p} / ${nCommon} karşılaştırılıyor…`);
+
+        const [ra, rb] = await Promise.all([
+          renderPage(state.A.pdf, p, CONFIG.renderMaxDim),
+          renderPage(state.B.pdf, p, CONFIG.renderMaxDim),
+        ]);
+
+        const [itemsA, itemsB] = await Promise.all([
+          extractTextItems(ra.page, ra.viewport),
+          extractTextItems(rb.page, rb.viewport),
+        ]);
+
+        const arA = ra.baseViewport.width / ra.baseViewport.height;
+        const arB = rb.baseViewport.width / rb.baseViewport.height;
+        if(Math.abs(arA - arB) / arA > 0.01){
+          warnings.push(`Sayfa ${p}: iki dosya arasında sayfa boyutu/en-boy oranı farklı — görsel hizalama yaklaşık olacaktır.`);
+        }
+
+        // Grid ("satranç tahtası") coordinates are always read off the NEW
+        // revision, per page — a template can change which edges carry
+        // letters vs numbers between revisions, and even sheet-to-sheet
+        // within one drawing set (see detectGrid's header comment).
+        const grid = detectGrid(itemsB);
+        if(!grid) noGridPages.push(p);
+        const frame = grid ? grid.frame : null;
+
+        // Everything outside the detected grid frame, plus every manually
+        // marked ignore region, is dropped BEFORE diffing — not diffed, not
+        // reported, period. This is what stops antet fields (names,
+        // companies, dates, signatures) from ever being compared to each
+        // other in the first place, instead of trying to filter their
+        // mismatches out after the fact.
+        const bodyItemsA = itemsA.filter(it => !isExcluded(it, frame, ignoreRegions));
+        const bodyItemsB = itemsB.filter(it => !isExcluded(it, frame, ignoreRegions));
+
+        const rawBodyAll = diffTextItems(bodyItemsA, bodyItemsB, CONFIG.body);
+        // Pixel-diff masking (below) needs every raw change, INCLUDING the
+        // trivial ones about to be filtered out of the written report — a
+        // date or revision-letter edit still puts new ink on the page, and
+        // that ink must not itself trip MODEL GÖRÜNÜMLERİ.
+        const changeBoxes = buildTextChangeBoxes([
+          ...rawBodyAll.modified, ...rawBodyAll.added, ...rawBodyAll.removed,
+        ]);
+        const rawBody = {
+          unchanged: rawBodyAll.unchanged,
+          modified: rawBodyAll.modified.filter(m => !isTrivialChange(m.old, m.new)),
+          added: rawBodyAll.added.filter(a => !isDateLike(a.str) && !isRevisionLike(a.str)),
+          removed: rawBodyAll.removed.filter(r => !isDateLike(r.str) && !isRevisionLike(r.str)),
+        };
+        const { keep: body, noteLabels } = splitProseChanges(rawBody, bodyItemsA, bodyItemsB, grid && grid.coordFor);
+
+        const excludeBoxes = buildExcludeBoxes(frame, ignoreRegions);
+        const visual = computeVisualDiff(ra.canvas, rb.canvas, excludeBoxes, changeBoxes);
+
+        // The details table was removed with the Turkish-only output, so the
+        // raw per-page diff goes to the console (F12) for debugging phantom
+        // or missing lines.
+        console.debug(`[compare] page ${p}`, { rawBody, body, noteLabels, grid,
+          visual: { bodyChangedFraction: visual.bodyChangedFraction } });
+
+        pages.push({ pageNum: p, body, noteLabels, visual, coordFor: grid && grid.coordFor, ra, rb });
+      }
+
+      if(noGridPages.length){
+        warnings.push(`Satranç tahtası koordinat sistemi şu sayfa(lar)da tespit edilemedi: ${noGridPages.join(', ')} — bu sayfalardaki değişiklikler koordinat etiketi olmadan raporlanacaktır.`);
+      }
+
+      const summary = buildTurkishSummary(pages, nA, nB);
+      showResults(summary, pages);
+      setStatus(warnings.length ? warnings.join('\n') : null);
+    } catch(err){
+      console.error(err);
+      setStatus('Hata: ' + err.message, true);
+    }
+  }
+
+  $('compareBtn').addEventListener('click', runComparison);
+  $('calibrateBtn').addEventListener('click', openCalibration);
+
+  // ---------- help popovers ----------
+  // One shared popover, repositioned/refilled per button — keeps the DOM
+  // light and the behavior identical everywhere a "?" appears.
+  const HELP_TEXTS = {
+    genel: 'Soldaki kutuya önceki revizyonun, sağdaki kutuya yeni revizyonun PDF\'ini bırakın. "Revizyonları Karşılaştır"a basınca tüm sayfalar otomatik eşleştirilir (1. sayfa 1. sayfayla, vb.) ve hem yazılı revizyon notları hem de görsel fark üretilir. Araç, çizimin çevresindeki satranç tahtası referans ızgarasını otomatik bulmaya çalışır; bulamazsa veya antet ızgaranın dışına taşıyorsa, göz ardı edilecek bölgeleri elle işaretleyebilirsiniz.',
+    antet: 'Antet, revizyon tablosu, onay imzaları, doküman bilgileri gibi karşılaştırmaya dahil edilmemesi gereken alanları buradan işaretleyebilirsiniz. Birden fazla bölge ekleyebilirsiniz (ör. hem antet hem de ayrı bir parça listesi). Bu bölgelerdeki hiçbir metin veya görsel fark rapora yansımaz. Ayrıca araç, sayfa kenarındaki satranç tahtası ızgarasını bulabilirse ızgaranın dışındaki her şeyi (antet dahil) otomatik olarak göz ardı eder — elle işaretleme, bunun üzerine ek bir güvence, ya da ızgara tespit edilemediğinde tek çözümdür.',
+    notlar: 'Bu bölüm, tespit edilen mühendislik değişikliklerini revizyon tablosuna kopyalanabilecek hazır Türkçe notlar hâlinde listeler: model görünümü güncellemeleri, ölçü/ifade değişiklikleri, İŞLEM/NOT açıklama düzenlemeleri, eklenen/silinen değerler. Mümkünse her satırın başında değişikliğin sayfa üzerindeki satranç tahtası koordinatı köşeli parantez içinde belirtilir, örn. "[C-4]". Antet metinleri (isim, şirket, tarih, revizyon harfi vb.) kasıtlı olarak hiç raporlanmaz. "Kopyala" ile panoya alabilirsiniz. Sonuçlar bir tahmin motorudur — özellikle sıra dışı görünen satırları görsel fark ile karşılaştırın.',
+    gorsel: '"Fark Katmanı" iki revizyonu üst üste bindirir: gri = değişmedi, kırmızı = eski revizyonda olup yenide olmayan, mavi = yeni revizyonda olup eskide olmayan. Göz ardı edilen bölgeler ve satranç tahtası ızgarasının dışındaki alan bu görünümde de hesaba katılmaz. "Kaydırıcı" iki sayfayı yan yana kıyaslamak için bir çizgiyle böler. "Sadece Eski"/"Sadece Yeni" tek bir revizyonu gösterir. Sayfa seçiciden istediğiniz sayfaya geçebilirsiniz. +/− ile yakınlaşıp uzaklaşarak PDF\'nin ayrıntılarını (küçük ölçü yazıları, ince çizgiler) inceleyebilir, "Sığdır" ile panele geri sığdırabilirsiniz; yakınlaştığınızda görüntü kaydırılabilir hâle gelir.',
+  };
+  const helpPopover = $('helpPopover');
+  function closeHelp(){ helpPopover.classList.remove('open'); helpPopover.dataset.forBtn = ''; }
+  document.querySelectorAll('.help-btn').forEach(btn => {
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const isOpenForThis = helpPopover.classList.contains('open') && helpPopover.dataset.forBtn === btn.dataset.help;
+      if(isOpenForThis){ closeHelp(); return; }
+      helpPopover.textContent = HELP_TEXTS[btn.dataset.help] || '';
+      helpPopover.dataset.forBtn = btn.dataset.help;
+      helpPopover.classList.add('open');
+      const r = btn.getBoundingClientRect();
+      const popW = 300;
+      let left = Math.min(r.left, window.innerWidth - popW - 16);
+      left = Math.max(8, left);
+      let top = r.bottom + 8;
+      helpPopover.style.left = left + 'px';
+      helpPopover.style.top = top + 'px';
+      // Flip above the button if it would overflow the bottom of the viewport.
+      const popH = helpPopover.offsetHeight;
+      if(top + popH > window.innerHeight - 8){
+        helpPopover.style.top = Math.max(8, r.top - popH - 8) + 'px';
+      }
+    });
+  });
+  document.addEventListener('click', (e) => {
+    if(helpPopover.classList.contains('open') && !helpPopover.contains(e.target)) closeHelp();
+  });
+  document.addEventListener('keydown', (e) => { if(e.key === 'Escape') closeHelp(); });
+
+  // ---------- init ----------
+  wireDropzone('A'); wireDropzone('B');
+  updateRegionStatus();
+
+  if(typeof pdfjsLib === 'undefined'){
+    setStatus('PDF motoru (pdf.js) CDN\'den yüklenemedi. İnternet bağlantınızı kontrol edip sayfayı yeniden yükleyin.', true);
+  }
+
+})();
+</script>
+</body>
+</html>
